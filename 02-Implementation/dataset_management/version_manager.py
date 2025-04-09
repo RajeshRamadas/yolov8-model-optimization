@@ -3,27 +3,31 @@ import json
 import re
 import boto3
 from datetime import datetime
-from dotenv import load_dotenv
 from typing import Optional
 
-# Load environment variables
-load_dotenv()
+# Get credentials from Jenkins environment
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+METADATA_BUCKET = os.environ.get("METADATA_BUCKET", os.environ.get("S3_BUCKET_NAME", "yolov8-model-repository"))
+METADATA_KEY = os.environ.get("METADATA_KEY", "versioning/metadata.json")
 
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-METADATA_BUCKET = os.getenv("METADATA_BUCKET", os.getenv("S3_BUCKET_NAME"))
-METADATA_KEY = os.getenv("METADATA_KEY", "versioning/metadata.json")
-
-s3 = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
-)
+def get_s3_client():
+    """Create and return an S3 client using credentials from environment"""
+    if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+        print("[ERROR] AWS credentials not found in environment")
+        raise ValueError("AWS credentials missing - ensure they are configured in Jenkins")
+        
+    return boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_DEFAULT_REGION
+    )
 
 def download_metadata() -> dict:
     try:
+        s3 = get_s3_client()
         obj = s3.get_object(Bucket=METADATA_BUCKET, Key=METADATA_KEY)
         return json.loads(obj['Body'].read())
     except s3.exceptions.NoSuchKey:
@@ -33,6 +37,7 @@ def download_metadata() -> dict:
         return {}
 
 def upload_metadata(data: dict):
+    s3 = get_s3_client()
     s3.put_object(
         Bucket=METADATA_BUCKET,
         Key=METADATA_KEY,
