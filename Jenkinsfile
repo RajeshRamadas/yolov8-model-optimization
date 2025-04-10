@@ -301,7 +301,7 @@ pipeline {
                             # Run the targeted augmentation with the specified parameters
                             echo "Running targeted augmentation with parameters as specified..."
                             cd "${AUGMENTATION_DIR}"
-                            python targeted_augmentation.py --dataset "${DATASET_DIR}" --output "augmented_dataset" --threshold 2 --factor 2
+                            python targeted_augmentation.py --dataset "${DATASET_DIR}" --output "augmented_dataset" --threshold 10 --factor 5
                             
                             # Save the absolute path to the augmentation directory for later stages
                             AUG_DIR=$(pwd)
