@@ -9,12 +9,12 @@ with open("requirements.txt", "r", encoding="utf-8") as f:
 setup(
     name="yolov8-nas",
     version="0.1.0",
-    author="YOLOv8 NAS Contributors",
-    author_email="your.email@example.com",
+    author="Rajesh kumar Ramadas",
+    author_email="Rajeshkumar1988r@gmail.com",
     description="Neural Architecture Search for YOLOv8 models",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/yolov8-nas",
+    url="https://github.com/RajeshRamadas/yolov8-model-optimization",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
