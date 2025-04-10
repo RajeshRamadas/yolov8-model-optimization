@@ -1,0 +1,3 @@
+[submodule "02-Implementation/highway-vehicle-tracker"]
+	path = 02-Implementation/highway-vehicle-tracker
+	url = https://github.com/RajeshRamadas/highway-vehicle-tracker.git
