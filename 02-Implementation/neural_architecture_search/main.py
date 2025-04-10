@@ -51,12 +51,12 @@ def parse_args():
 
 def rename_model_files(results_dir):
     """
-    Rename model weight files by adding trial numbers to filenames.
+    Rename original model weight files by adding trial numbers to filenames.
     
     Args:
         results_dir (str): Path to the results directory
     """
-    print("\nRenaming model files to include trial numbers...")
+    print("\nRenaming original model files to include trial numbers...")
     
     # Process each trial directory
     trial_dirs = [d for d in os.listdir(results_dir) if d.startswith("trial_")]
@@ -74,14 +74,14 @@ def rename_model_files(results_dir):
         best_model = os.path.join(weights_dir, "best.pt")
         if os.path.exists(best_model):
             new_best_name = os.path.join(weights_dir, f"best_trial_{trial_id}.pt")
-            shutil.copy(best_model, new_best_name)
+            os.rename(best_model, new_best_name)
             renamed_count += 1
             
         # Rename last.pt to last_trial_{trial_id}.pt if it exists
         last_model = os.path.join(weights_dir, "last.pt")
         if os.path.exists(last_model):
             new_last_name = os.path.join(weights_dir, f"last_trial_{trial_id}.pt")
-            shutil.copy(last_model, new_last_name)
+            os.rename(last_model, new_last_name)
             renamed_count += 1
     
     print(f"Renamed {renamed_count} model files")
@@ -178,20 +178,22 @@ def main():
         # Save best model information
         save_json(best_model, os.path.join(results_dir, "best_model.json"))
         
-        # Create a copy of the best model in the root results directory
+        # Copy the renamed best model to the root results directory
         if not args.no_rename:
             best_weights_dir = os.path.join(results_dir, f"trial_{trial_id}", "weights")
-            if os.path.exists(os.path.join(best_weights_dir, "best.pt")):
-                # Copy with descriptive name
+            renamed_best_model = os.path.join(best_weights_dir, f"best_trial_{trial_id}.pt")
+            if os.path.exists(renamed_best_model):
+                # Copy with descriptive name to root directory
                 best_model_name = os.path.join(results_dir, f"best_model_trial_{trial_id}.pt")
-                shutil.copy(os.path.join(best_weights_dir, "best.pt"), best_model_name)
+                shutil.copy(renamed_best_model, best_model_name)
                 print(f"Copied best model to: {best_model_name}")
         
         print(f"\nBest model saved at:")
-        print(f"  Standard path: {results_dir}/trial_{trial_id}/weights/best.pt")
         if not args.no_rename:
-            print(f"  With trial ID: {results_dir}/trial_{trial_id}/weights/best_trial_{trial_id}.pt")
+            print(f"  Renamed path: {results_dir}/trial_{trial_id}/weights/best_trial_{trial_id}.pt")
             print(f"  Root copy:    {results_dir}/best_model_trial_{trial_id}.pt")
+        else:
+            print(f"  Standard path: {results_dir}/trial_{trial_id}/weights/best.pt")
         print(f"Results report: {results_dir}/nas_report.html")
     else:
         print("No successful trials found")
