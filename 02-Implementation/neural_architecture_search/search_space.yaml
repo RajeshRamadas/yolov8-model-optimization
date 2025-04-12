@@ -68,7 +68,7 @@ objective_weights:
 # Default parameters for the search process
 defaults:
   trials: 10
-  epochs: 10
+  epochs: 50
   results_dir: "nas_results"
   parallel: 1
   objective: "map"  # Can be "map", "latency", "size", or "combined"
