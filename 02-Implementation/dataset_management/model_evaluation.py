@@ -153,20 +153,37 @@ def benchmark_model(model_path, img_size=640, batch_size=1, num_iters=100, devic
             "model_size_mb": os.path.getsize(model_path) / (1024 * 1024)
         }
 
-def find_models(root_dir, recursive=True):
+def find_models(root_dir, recursive=True, best_only=True):
     """
-    Find all .pt model files in the given directory
+    Find model files in the given directory, optionally filtering for best.pt only
     
     Args:
         root_dir: Root directory to search for models
         recursive: Whether to search recursively in subdirectories
+        best_only: If True, only include files named best.pt and exclude last.pt
     
     Returns:
         list: List of paths to model files
     """
     pattern = os.path.join(root_dir, '**/*.pt' if recursive else '*.pt')
-    model_paths = glob.glob(pattern, recursive=recursive)
-    print(f"Found {len(model_paths)} model files in {root_dir}")
+    all_model_paths = glob.glob(pattern, recursive=recursive)
+    
+    if best_only:
+        # Filter to include "best.pt" files and exclude "last.pt" files
+        model_paths = []
+        for path in all_model_paths:
+            filename = os.path.basename(path)
+            if filename == "best.pt" or (filename != "last.pt" and "best" in filename):
+                model_paths.append(path)
+        
+        # Log what was found and what was filtered
+        excluded_count = len(all_model_paths) - len(model_paths)
+        print(f"Found {len(all_model_paths)} total model files in {root_dir}")
+        print(f"After filtering: {len(model_paths)} best models kept, {excluded_count} models excluded")
+    else:
+        model_paths = all_model_paths
+        print(f"Found {len(model_paths)} model files in {root_dir}")
+    
     return model_paths
 
 def detect_model_variant(model_path):
@@ -554,6 +571,7 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for evaluation')
     parser.add_argument('--non-recursive', action='store_true', help='Do not search subdirectories for models')
     parser.add_argument('--skip-benchmark', action='store_true', help='Skip speed benchmarking')
+    parser.add_argument('--all-models', action='store_true', help='Include all models (don\'t skip last.pt)')
     return parser.parse_args()
 
 def main():
@@ -570,11 +588,15 @@ def main():
     evaluations_dir = os.path.join(args.output_dir, 'evaluations', args.task)
     os.makedirs(evaluations_dir, exist_ok=True)
     
-    # Get model paths
+    # Get model paths - updated to respect best_only parameter
     model_paths = []
     if args.models_dir:
-        model_paths = find_models(args.models_dir, recursive=not args.non_recursive)
+        # Use the new best_only parameter based on all_models flag
+        model_paths = find_models(args.models_dir, 
+                                  recursive=not args.non_recursive,
+                                  best_only=not args.all_models)
     elif args.model:
+        # If a specific model is provided, always use it regardless of filename
         model_paths = [args.model]
     else:
         print("Error: Either --models-dir or --model must be specified")
@@ -583,6 +605,11 @@ def main():
     if not model_paths:
         print("No model files found")
         return
+        
+    # Print the models that will be evaluated
+    print(f"Will evaluate {len(model_paths)} models:")
+    for i, model_path in enumerate(model_paths):
+        print(f"  {i+1}. {model_path}")
     
     # Evaluate all models
     all_metrics = []
@@ -650,8 +677,16 @@ def main():
         print(f"Warning: Could not create symlink to latest report: {str(e)}")
     
     # Save all metrics to CSV
-    csv_path = os.path.join(args.output_dir, f"all_models_benchmark_{timestamp}.csv")
+    csv_path = os.path.join(args.output_dir, f"best_models_benchmark_{timestamp}.csv")
     update_benchmark_csv(all_metrics, csv_path)
+    
+    # Save best model results separately
+    if len(all_metrics) > 0:
+        best_model = all_metrics[0]  # Already sorted by mAP50
+        best_model_path = os.path.join(evaluations_dir, "best_eval_results.json")
+        with open(best_model_path, 'w') as f:
+            json.dump(best_model, f, indent=2)
+        print(f"Best model results saved to: {best_model_path}")
     
     print(f"Evaluation complete. Results saved to {args.output_dir}")
     print(f"HTML report: {html_report_path}")
