@@ -53,7 +53,7 @@ This repository provides a comprehensive framework for optimizing YOLOv8 object 
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/yolov8-model-optimization.git
+git clone https://github.com/rajeshramadas/yolov8-model-optimization.git
 cd yolov8-model-optimization
 
 # Install dependencies
