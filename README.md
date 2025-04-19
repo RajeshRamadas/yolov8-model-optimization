@@ -4,7 +4,7 @@
 
 This repository provides a comprehensive framework for optimizing YOLOv8 object detection models through Neural Architecture Search (NAS). The framework automates the entire process from dataset preparation to model deployment, helping researchers and developers find optimal network architectures that balance accuracy, speed, and model size.
 
-![YOLOv8 Model Optimization](https://via.placeholder.com/800x400.png?text=YOLOv8+Model+Optimization)
+## YOLOv8 Model Optimization
 
 ## Features
 
@@ -342,9 +342,6 @@ To extend the framework for your needs:
 4. **Integration with Other Tools**: Add stages to the Jenkinsfile for additional processing or deployment
 5. **Custom Export Formats**: Add support for additional model export formats (TensorRT, ONNX, etc.)
 
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Acknowledgments
 
