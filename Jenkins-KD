@@ -34,7 +34,6 @@ pipeline {
 
     options {
         // Set timeout for the entire build
-        timeout(time: 16, unit: 'HOURS')
         // Keep the 10 most recent builds
         buildDiscarder(logRotator(numToKeepStr: '10'))
         // Don't run concurrent builds to avoid conflicts
@@ -111,26 +110,12 @@ pipeline {
             cd downloads
             python -m gdown https://drive.google.com/uc?id=${GDRIVE_FILE_ID} -O ${OUTPUT_ZIP}
 
-            # Check if download was successful and file has content
             if [ ! -f "${OUTPUT_ZIP}" ]; then
-                echo "Download failed! File not found."
                 exit 1
             fi
 
-            # Verify file size
-            FILE_SIZE=$(stat -c%s "${OUTPUT_ZIP}")
-            if [ $FILE_SIZE -lt 10000 ]; then
-                echo "Download appears incomplete. File size is only $FILE_SIZE bytes."
-                echo "Content of the file:"
-                head -c 1000 "${OUTPUT_ZIP}"
-                exit 1
-            fi
-
-            echo "Download completed successfully. File size: $FILE_SIZE bytes"
         '''
 
-        // Archive the dataset as an artifact with expanded path
-        archiveArtifacts artifacts: "downloads/dataset.zip", fingerprint: true, allowEmptyArchive: true
     }
 }
 
@@ -140,30 +125,11 @@ pipeline {
     }
     steps {
         sh '''#!/bin/bash -e
-            # Move to downloads directory
             cd downloads
-
-            # Verify the zip file exists and has content
-            if [ ! -f "${OUTPUT_ZIP}" ]; then
-                echo "Error: Zip file ${OUTPUT_ZIP} not found!"
-                exit 1
-            fi
-
-            FILE_SIZE=$(stat -c%s "${OUTPUT_ZIP}")
-            echo "Zip file size: $FILE_SIZE bytes"
-
-            # Check file type to ensure it's a valid zip
-            echo "File type information:"
-            file "${OUTPUT_ZIP}"
 
             # Create extraction directory if it doesn't exist
             mkdir -p ${EXTRACT_DIR}
 
-            # Try to list contents first
-            echo "Listing zip contents:"
-            unzip -l ${OUTPUT_ZIP} || echo "Warning: Unable to list contents of zip file"
-
-            # Extract the zip file with verbose output
             echo "Extracting dataset..."
             unzip -o ${OUTPUT_ZIP} -d ${EXTRACT_DIR}
 
@@ -173,8 +139,6 @@ pipeline {
 
             if [ -z "${DATA_YAML_PATH}" ]; then
                 echo "data.yaml not found in the extracted dataset!"
-                echo "Contents of extraction directory:"
-                ls -la ${EXTRACT_DIR}
                 exit 1
             fi
 
@@ -192,7 +156,6 @@ pipeline {
         '''
 
         // Archive the path file as an artifact
-        archiveArtifacts artifacts: 'downloads/data_yaml_path.txt', fingerprint: true, allowEmptyArchive: true
     }
 }
 
@@ -751,61 +714,23 @@ pipeline {
             # Find the best model from NAS to use as the student model
             STUDENT_MODEL_BASE=""
 
-            # Create debug logs directory
-            mkdir -p ${WORKSPACE}/debug_logs
-
-            # Debug log to check best_model.json
-            echo "Searching for best_model.json..." > ${WORKSPACE}/debug_logs/kd_debug.log
-            find ${WORKSPACE} -name "best_model.json" >> ${WORKSPACE}/debug_logs/kd_debug.log
-
-            # Set default values in case we can't find or extract them
-            DEPTH_MULTIPLE=0.33
-            WIDTH_MULTIPLE=0.25
-            KERNEL_SIZE=3
-            IMG_SIZE=640
-
             # Try to find the best model from the NAS results
             if [ -f "${WORKSPACE}/thorough_nas/best_model.json" ]; then
-                echo "Found best_model.json at ${WORKSPACE}/thorough_nas/best_model.json" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                # Also print the content for debugging
-                echo "Content of best_model.json:" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                cat "${WORKSPACE}/thorough_nas/best_model.json" >> ${WORKSPACE}/debug_logs/kd_debug.log
-
-                TRIAL_NUM=$(grep -o '"trial_id": [0-9]*' ${WORKSPACE}/thorough_nas/best_model.json | awk '{print $2}')
-                if [ -z "$TRIAL_NUM" ]; then
                     TRIAL_NUM=$(grep -o '"trial": [0-9]*' ${WORKSPACE}/thorough_nas/best_model.json | awk '{print $2}')
-                fi
-                echo "Extracted TRIAL_NUM: ${TRIAL_NUM}" >> ${WORKSPACE}/debug_logs/kd_debug.log
-
                 if [ -n "$TRIAL_NUM" ] && [ -d "${WORKSPACE}/thorough_nas/trial_${TRIAL_NUM}" ]; then
                     # We'll pass the model architecture parameters, not the weights
                     # Get the model params from the best_model.json
                     STUDENT_MODEL_BASE="${WORKSPACE}/thorough_nas/trial_${TRIAL_NUM}"
                     echo "Found best NAS model architecture from trial ${TRIAL_NUM} to use as student base"
 
-                    # Extract important parameters for the student model - with error handling
                     python -c "
 import json
 import os
-import sys
 
-try:
     with open('${WORKSPACE}/thorough_nas/best_model.json', 'r') as f:
         data = json.load(f)
 
-    # Print the data structure for debugging
-    print('JSON data structure:', file=sys.stderr)
-    print(data, file=sys.stderr)
-
     # Extract params with defaults if not found
-    params = data.get('params', {})
-    depth_multiple = params.get('depth_multiple', 0.33)
-    width_multiple = params.get('width_multiple', 0.25)
-    kernel_size = params.get('kernel_size', 3)
-    img_size = params.get('img_size', 640)
-
-    # Print extracted values
-    print(f'Extracted values - depth: {depth_multiple}, width: {width_multiple}, kernel: {kernel_size}, img: {img_size}', file=sys.stderr)
 
     # Save to files for shell script to read
     with open('/tmp/depth_multiple.txt', 'w') as f:
@@ -818,59 +743,15 @@ try:
         f.write(str(img_size))
 
     print(f'Extracted NAS parameters: depth={depth_multiple}, width={width_multiple}, kernel={kernel_size}, img_size={img_size}')
-except Exception as e:
-    print(f'Error extracting parameters: {e}', file=sys.stderr)
-    # Write default values to files
-    with open('/tmp/depth_multiple.txt', 'w') as f:
-        f.write('0.33')
-    with open('/tmp/width_multiple.txt', 'w') as f:
-        f.write('0.25')
-    with open('/tmp/kernel_size.txt', 'w') as f:
-        f.write('3')
-    with open('/tmp/img_size.txt', 'w') as f:
-        f.write('640')
-    print('Using default parameters due to error')
-" 2>> ${WORKSPACE}/debug_logs/kd_debug.log
-
-                    # Read parameters from files with verification
-                    if [ -f "/tmp/depth_multiple.txt" ]; then
                         DEPTH_MULTIPLE=$(cat /tmp/depth_multiple.txt)
-                        echo "Read DEPTH_MULTIPLE: ${DEPTH_MULTIPLE}" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                    else
-                        echo "Warning: /tmp/depth_multiple.txt not found. Using default." >> ${WORKSPACE}/debug_logs/kd_debug.log
-                        DEPTH_MULTIPLE=0.33
-                    fi
-
-                    if [ -f "/tmp/width_multiple.txt" ]; then
                         WIDTH_MULTIPLE=$(cat /tmp/width_multiple.txt)
-                        echo "Read WIDTH_MULTIPLE: ${WIDTH_MULTIPLE}" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                    else
-                        echo "Warning: /tmp/width_multiple.txt not found. Using default." >> ${WORKSPACE}/debug_logs/kd_debug.log
-                        WIDTH_MULTIPLE=0.25
-                    fi
-
-                    if [ -f "/tmp/kernel_size.txt" ]; then
                         KERNEL_SIZE=$(cat /tmp/kernel_size.txt)
-                        echo "Read KERNEL_SIZE: ${KERNEL_SIZE}" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                    else
-                        echo "Warning: /tmp/kernel_size.txt not found. Using default." >> ${WORKSPACE}/debug_logs/kd_debug.log
-                        KERNEL_SIZE=3
-                    fi
-
-                    if [ -f "/tmp/img_size.txt" ]; then
                         IMG_SIZE=$(cat /tmp/img_size.txt)
-                        echo "Read IMG_SIZE: ${IMG_SIZE}" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                    else
-                        echo "Warning: /tmp/img_size.txt not found. Using default." >> ${WORKSPACE}/debug_logs/kd_debug.log
-                        IMG_SIZE=640
-                    fi
 
                     echo "Using NAS best architecture with depth_multiple: ${DEPTH_MULTIPLE}, width_multiple: ${WIDTH_MULTIPLE}, kernel_size: ${KERNEL_SIZE}, img_size: ${IMG_SIZE}"
                 fi
             else
-                echo "No best_model.json found from NAS. Will use default yolov8n.yaml as student base." >> ${WORKSPACE}/debug_logs/kd_debug.log
                 STUDENT_MODEL_BASE="yolov8n.yaml"
-                echo "Using default parameters: depth_multiple=${DEPTH_MULTIPLE}, width_multiple=${WIDTH_MULTIPLE}, kernel_size=${KERNEL_SIZE}, img_size=${IMG_SIZE}"
             fi
 
             # Read the augmentation directory path with error handling
@@ -899,12 +780,9 @@ except Exception as e:
             # Load class count from YAML
             NC=$(python -c "
 import yaml
-try:
     with open('${YAML_PATH}', 'r') as f:
         data = yaml.safe_load(f)
     print(data.get('nc', 80))
-except Exception as e:
-    print(80)  # Default if an error occurs
 ")
 
             # Create a directory for knowledge distillation results
@@ -918,36 +796,14 @@ except Exception as e:
             python -c "
 import yaml
 import copy
-import sys
-
-# Validate parameters - ensure they're numeric
-try:
-    NC = int('${NC}')
-    DEPTH_MULTIPLE = float('${DEPTH_MULTIPLE}')
-    WIDTH_MULTIPLE = float('${WIDTH_MULTIPLE}')
-    KERNEL_SIZE = int('${KERNEL_SIZE}')
-    print(f'Using parameters: NC={NC}, depth={DEPTH_MULTIPLE}, width={WIDTH_MULTIPLE}, kernel={KERNEL_SIZE}', file=sys.stderr)
-except ValueError as e:
-    print(f'Error converting parameters to numeric values: {e}', file=sys.stderr)
-    print('Using default values instead', file=sys.stderr)
-    NC = 80
-    DEPTH_MULTIPLE = 0.33
-    WIDTH_MULTIPLE = 0.25
-    KERNEL_SIZE = 3
 
 # Base configuration from yolov8n.yaml
 try:
     from ultralytics.models.yolo import yolov8n
     base_model = yolov8n.yaml
     base_config = copy.deepcopy(base_model)
-    print('Successfully imported yolov8n base model', file=sys.stderr)
-except Exception as e:
-    print(f'Error importing yolov8n: {e}', file=sys.stderr)
     # Fallback if we can't import directly
     base_config = {
-        'nc': NC,
-        'depth_multiple': DEPTH_MULTIPLE,
-        'width_multiple': WIDTH_MULTIPLE,
         'backbone': [
             # [from, repeats, module, args]
             [-1, 1, 'Conv', [64, 3, 2]],  # 0-P1/2
@@ -984,9 +840,6 @@ except Exception as e:
 
 # Apply NAS parameters
 config = {
-    'nc': NC,
-    'depth_multiple': DEPTH_MULTIPLE,
-    'width_multiple': WIDTH_MULTIPLE
 }
 
 # Copy backbone and head from base config
@@ -994,7 +847,6 @@ config['backbone'] = base_config.get('backbone', [])
 config['head'] = base_config.get('head', [])
 
 # Apply kernel_size to appropriate Conv layers
-kernel_size = KERNEL_SIZE
 for section in ['backbone', 'head']:
     for layer in config[section]:
         if 'Conv' in layer[2]:  # Only for Conv modules
@@ -1007,13 +859,9 @@ for section in ['backbone', 'head']:
                     if len(layer[3]) > 2:
                         layer[3][2] = original_stride  # Preserve stride
 
-try:
     with open('${STUDENT_CONFIG}', 'w') as f:
         yaml.dump(config, f, default_flow_style=None)
     print(f'Created custom student config at ${STUDENT_CONFIG} with kernel_size={kernel_size}')
-except Exception as e:
-    print(f'Error creating student config: {e}', file=sys.stderr)
-" 2>> ${WORKSPACE}/debug_logs/kd_debug.log
 
             # Log start time for performance tracking
             echo "KD Start Time: $(date)" > ${ARTIFACT_DIR}/kd_timing.txt
@@ -1047,7 +895,6 @@ except Exception as e:
                     STUDENT_NAME_SAFE=$(echo $STUDENT_NAME | tr '.' '_')
 
                     # Run the knowledge distillation with this parameter combination
-                    set +e  # Don't exit on error
                     python ${MODEL_OPT_REPO}/knowledge_distillation.py \
                         --data "${YAML_PATH}" \
                         --teacher_model "yolov8x.yaml" \
@@ -1058,13 +905,6 @@ except Exception as e:
                         --student_name "${STUDENT_NAME_SAFE}" \
                         --alpha ${ALPHA} \
                         --temperature ${TEMP}
-                    KD_STATUS=$?
-                    set -e  # Restore exit on error
-
-                    if [ $KD_STATUS -ne 0 ]; then
-                        echo "Warning: Knowledge distillation for alpha=${ALPHA}, temperature=${TEMP} failed with status ${KD_STATUS}. Continuing with next combination."
-                        continue
-                    fi
 
                     # Find the student model path
                     STUDENT_MODEL_PATH=$(find ${WORKSPACE}/runs/detect -name "best.pt" | grep "${STUDENT_NAME_SAFE}" | head -1)
@@ -1083,7 +923,6 @@ except Exception as e:
                     echo "Evaluating student model with alpha=${ALPHA}, temperature=${TEMP}..."
 
                     # Find model_evaluation.py script
-                    EVALUATION_SCRIPT_PATH=$(find ${WORKSPACE}/${MODEL_OPT_REPO} -name "model_evaluation.py" -type f | head -1)
 
                     if [ -z "${EVALUATION_SCRIPT_PATH}" ]; then
                         echo "model_evaluation.py not found - using fallback evaluation method"
@@ -1117,42 +956,11 @@ with open('/tmp/model_metrics.json', 'w') as f:
                         EVAL_OUTPUT_DIR="${WORKSPACE}/kd_results/evaluations/${STUDENT_NAME_SAFE}"
                         mkdir -p "${EVAL_OUTPUT_DIR}"
 
-                        set +e  # Don't exit on error
                         python "${EVALUATION_SCRIPT_PATH}" \
                             --model "${STUDENT_MODEL_PATH}" \
                             --data "${YAML_PATH}" \
                             --output-dir "${EVAL_OUTPUT_DIR}"
-                        EVAL_STATUS=$?
-                        set -e  # Restore exit on error
 
-                        if [ $EVAL_STATUS -ne 0 ]; then
-                            echo "Warning: Evaluation for student model with alpha=${ALPHA}, temperature=${TEMP} failed. Using fallback."
-                            # Fallback evaluation
-                            python -c "
-from ultralytics import YOLO
-import json
-import os
-
-model = YOLO('${STUDENT_MODEL_PATH}')
-results = model.val(data='${YAML_PATH}')
-
-metrics = {
-    'map50': float(results.box.map50),
-    'map50_95': float(results.box.map),
-    'model_size_mb': os.path.getsize('${STUDENT_MODEL_PATH}') / (1024 * 1024),
-    'fps': 0  # Can't measure FPS directly
-}
-
-with open('/tmp/model_metrics.json', 'w') as f:
-    json.dump(metrics, f)
-"
-                            # Read the metrics
-                            METRICS=$(cat /tmp/model_metrics.json)
-                            MAP50=$(echo $METRICS | python -c "import json, sys; print(json.load(sys.stdin)['map50'])")
-                            MAP50_95=$(echo $METRICS | python -c "import json, sys; print(json.load(sys.stdin)['map50_95'])")
-                            MODEL_SIZE=$(echo $METRICS | python -c "import json, sys; print(json.load(sys.stdin)['model_size_mb'])")
-                            FPS=0
-                        else
                             # Find evaluation results file
                             EVAL_FILE=$(find "${EVAL_OUTPUT_DIR}" -name "*_eval_results.json" | head -1)
 
@@ -1170,12 +978,10 @@ with open('/tmp/model_metrics.json', 'w') as f:
                                 MODEL_SIZE=0
                             fi
                         fi
-                    fi
 
                     # Add to results file
                     echo "${ALPHA},${TEMP},${MAP50},${MAP50_95},${FPS},${MODEL_SIZE},${MODEL_COPY}" >> $RESULTS_FILE
 
-                    # Check if this is the best model so far using bc for float comparison
                     if (( $(echo "$MAP50 > $BEST_MAP" | bc -l) )); then
                         BEST_MAP=$MAP50
                         BEST_MODEL_PATH=$MODEL_COPY
@@ -1192,7 +998,6 @@ with open('/tmp/model_metrics.json', 'w') as f:
             echo "KD End Time: $(date)" >> ${ARTIFACT_DIR}/kd_timing.txt
 
             # Create the best model link
-            mkdir -p ${WORKSPACE}/kd_results/student_model
             if [ -n "$BEST_MODEL_PATH" ] && [ -f "$BEST_MODEL_PATH" ]; then
                 echo "Best model found: $BEST_MODEL_PATH (alpha=$BEST_ALPHA, temperature=$BEST_TEMP, mAP50=$BEST_MAP)"
                 cp "$BEST_MODEL_PATH" "${WORKSPACE}/kd_results/student_model/student_best.pt"
@@ -1203,14 +1008,10 @@ with open('/tmp/model_metrics.json', 'w') as f:
                 LAST_MODEL=$(find ${WORKSPACE}/kd_results/models -name "*.pt" | sort | tail -1)
                 if [ -n "$LAST_MODEL" ] && [ -f "$LAST_MODEL" ]; then
                     cp "$LAST_MODEL" "${WORKSPACE}/kd_results/student_model/student_best.pt"
-                else
-                    echo "Warning: No trained models found. Creating an empty placeholder."
-                    touch "${WORKSPACE}/kd_results/student_model/student_best.pt"
                 fi
             fi
 
             # Generate a heatmap visualization of parameter combinations
-            if [ -f "$RESULTS_FILE" ] && [ -s "$RESULTS_FILE" ]; then
                 python -c "
 import pandas as pd
 import numpy as np
@@ -1218,12 +1019,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Read the results
-try:
     df = pd.read_csv('${RESULTS_FILE}')
-
-    if len(df) == 0:
-        print('Warning: Results file is empty. Skipping visualizations.')
-        exit(0)
 
     # Create pivot tables for different metrics
     for metric in ['map50', 'map50_95', 'fps', 'model_size_mb']:
