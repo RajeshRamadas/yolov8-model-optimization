@@ -2,10 +2,11 @@ pipeline {
     agent any
 
     parameters {
-        string(name: 'MODEL_NAME', defaultValue: 'yolov8_custom_model', description: 'YOLOv8 optimized model name with NAS')
+        string(name: 'MODEL_NAME', defaultValue: 'yolov8_kd_model', description: 'Knowledge distilled model name')
         string(name: 'GDRIVE_FILE_ID', defaultValue: '1R44tNwMYBU3kaQLB2cgqzb8HMNisEuqA', description: 'Google Drive file ID for dataset')
-        choice(name: 'NAS_TRIALS', choices: ['3', '5', '10','15'], description: 'Number of trials for Neural Architecture Search')
-        choice(name: 'NAS_EPOCHS', choices: ['2', '5', '10','50'], description: 'Number of epochs per trial')
+        choice(name: 'TEACHER_MODEL', choices: ['yolov8x'], description: 'Teacher model for knowledge distillation')
+        choice(name: 'STUDENT_MODEL', choices: ['yolov8n'], description: 'Student model for knowledge distillation')
+        choice(name: 'KD_EPOCHS', choices: ['10', '30', '50', '100'], description: 'Number of epochs for knowledge distillation')
         booleanParam(name: 'SKIP_DOWNLOAD', defaultValue: false, description: 'Skip dataset download if already available')
         booleanParam(name: 'SKIP_AUGMENTATION', defaultValue: false, description: 'Skip dataset augmentation')
         booleanParam(name: 'CLEAN_WORKSPACE', defaultValue: true, description: 'Clean workspace after build')
@@ -18,23 +19,22 @@ pipeline {
         DATA_YAML_PATH_FILE = 'data_yaml_path.txt'
 
         // Virtual environment and repository
-        VENV_NAME = 'dataset_venv'
-        MODEL_OPT_REPO = 'yolov8-model-optimization'
+        VENV_NAME = 'kd_venv'
+        KD_REPO = 'yolov8-kd'
 
         // Paths for generated files
         ARTIFACT_DIR = "${WORKSPACE}/artifacts"
-        MODEL_RESULT_DIR = "${WORKSPACE}/model_evaluation_results"
+        KD_RESULT_DIR = "${WORKSPACE}/kd_results"
         AUGMENTATION_PATH_FILE = "${WORKSPACE}/augmentation_dir_path.txt"
 
-        // S3 bucket information
+        // S3 bucket information (if needed)
         S3_BUCKET = 'yolov8-model-repository'
-        S3_PREFIX = 'yolov8_model_custom'
-
+        S3_PREFIX = 'yolov8_kd_models'
     }
 
     options {
         // Set timeout for the entire build
-        timeout(time: 16, unit: 'HOURS')
+        timeout(time: 8, unit: 'HOURS')
         // Keep the 10 most recent builds
         buildDiscarder(logRotator(numToKeepStr: '10'))
         // Don't run concurrent builds to avoid conflicts
@@ -50,16 +50,17 @@ pipeline {
                     // Create directories for outputs
                     sh '''
                         mkdir -p ${ARTIFACT_DIR}
-                        mkdir -p ${MODEL_RESULT_DIR}
+                        mkdir -p ${KD_RESULT_DIR}
                         mkdir -p email_artifacts
                         mkdir -p downloads
                     '''
 
                     // Display build information
-                    echo "Starting YOLOv8 Model Optimization Pipeline"
+                    echo "Starting YOLOv8 Knowledge Distillation Pipeline"
                     echo "Model Name: ${params.MODEL_NAME}"
-                    echo "NAS Trials: ${params.NAS_TRIALS}"
-                    echo "NAS Epochs: ${params.NAS_EPOCHS}"
+                    echo "Teacher Model: ${params.TEACHER_MODEL}"
+                    echo "Student Model: ${params.STUDENT_MODEL}"
+                    echo "KD Epochs: ${params.KD_EPOCHS}"
                 }
             }
         }
@@ -79,8 +80,8 @@ pipeline {
                     source ${VENV_NAME}/bin/activate
                     python -m pip install --upgrade pip
 
-                    # Install core dependencies that will be needed by many stages
-                    pip install numpy pandas matplotlib tqdm PyYAML
+                    # Install core dependencies
+                    pip install torch torchvision ultralytics matplotlib pandas seaborn numpy tqdm PyYAML
 
                     echo "Virtual environment setup complete."
                 '''
@@ -88,287 +89,468 @@ pipeline {
         }
 
         stage('Download Dataset') {
-    when {
-        expression { !params.SKIP_DOWNLOAD }
-    }
-    steps {
-        sh '''#!/bin/bash -e
-            # Activate virtual environment
-            source ${VENV_NAME}/bin/activate
-
-            # Check if dataset already exists
-            if [ -f "downloads/${OUTPUT_ZIP}" ] && [ -d "downloads/${EXTRACT_DIR}" ]; then
-                echo "Dataset already exists. Skipping download."
-                exit 0
-            fi
-
-            # Install gdown for Google Drive downloads
-            echo "Installing gdown..."
-            pip install gdown
-
-            # Download the file from Google Drive using gdown
-            echo "Downloading dataset from Google Drive..."
-            cd downloads
-            python -m gdown https://drive.google.com/uc?id=${GDRIVE_FILE_ID} -O ${OUTPUT_ZIP}
-
-            # Check if download was successful and file has content
-            if [ ! -f "${OUTPUT_ZIP}" ]; then
-                echo "Download failed! File not found."
-                exit 1
-            fi
-
-            # Verify file size
-            FILE_SIZE=$(stat -c%s "${OUTPUT_ZIP}")
-            if [ $FILE_SIZE -lt 10000 ]; then
-                echo "Download appears incomplete. File size is only $FILE_SIZE bytes."
-                echo "Content of the file:"
-                head -c 1000 "${OUTPUT_ZIP}"
-                exit 1
-            fi
-
-            echo "Download completed successfully. File size: $FILE_SIZE bytes"
-        '''
-
-        // Archive the dataset as an artifact with expanded path
-        archiveArtifacts artifacts: "downloads/dataset.zip", fingerprint: true, allowEmptyArchive: true
-    }
-}
-
-        stage('Extract and Validate Dataset') {
-    when {
-        expression { !params.SKIP_DOWNLOAD }
-    }
-    steps {
-        sh '''#!/bin/bash -e
-            # Move to downloads directory
-            cd downloads
-
-            # Verify the zip file exists and has content
-            if [ ! -f "${OUTPUT_ZIP}" ]; then
-                echo "Error: Zip file ${OUTPUT_ZIP} not found!"
-                exit 1
-            fi
-
-            FILE_SIZE=$(stat -c%s "${OUTPUT_ZIP}")
-            echo "Zip file size: $FILE_SIZE bytes"
-
-            # Check file type to ensure it's a valid zip
-            echo "File type information:"
-            file "${OUTPUT_ZIP}"
-
-            # Create extraction directory if it doesn't exist
-            mkdir -p ${EXTRACT_DIR}
-
-            # Try to list contents first
-            echo "Listing zip contents:"
-            unzip -l ${OUTPUT_ZIP} || echo "Warning: Unable to list contents of zip file"
-
-            # Extract the zip file with verbose output
-            echo "Extracting dataset..."
-            unzip -o ${OUTPUT_ZIP} -d ${EXTRACT_DIR}
-
-            # Find data.yaml file in the extracted directory
-            echo "Locating data.yaml file..."
-            DATA_YAML_PATH=$(find ${EXTRACT_DIR} -name "data.yaml" -type f | head -n 1)
-
-            if [ -z "${DATA_YAML_PATH}" ]; then
-                echo "data.yaml not found in the extracted dataset!"
-                echo "Contents of extraction directory:"
-                ls -la ${EXTRACT_DIR}
-                exit 1
-            fi
-
-            # Get absolute path
-            ABSOLUTE_PATH=$(readlink -f "${DATA_YAML_PATH}")
-
-            # Save the path to a file
-            echo "${ABSOLUTE_PATH}" > ${DATA_YAML_PATH_FILE}
-
-            echo "data.yaml path saved: ${ABSOLUTE_PATH}"
-
-            # Display first few lines of data.yaml
-            echo "First 5 lines of data.yaml:"
-            head -n 5 "${ABSOLUTE_PATH}"
-        '''
-
-        // Archive the path file as an artifact
-        archiveArtifacts artifacts: 'downloads/data_yaml_path.txt', fingerprint: true, allowEmptyArchive: true
-    }
-}
-
-        stage('Setup Model Optimization Repository') {
+            when {
+                expression { !params.SKIP_DOWNLOAD }
+            }
             steps {
                 sh '''#!/bin/bash -e
                     # Activate virtual environment
                     source ${VENV_NAME}/bin/activate
 
-                    # Check if the repository directory exists
-                    if [ -d "${MODEL_OPT_REPO}" ]; then
-                        echo "Model optimization repository directory already exists, updating it..."
-                        cd ${MODEL_OPT_REPO}
-                        git pull
-                        cd ..
-                    else
-                        # Clone the model optimization repository
-                        echo "Downloading YOLOv8 model optimization repository..."
-                        git clone https://github.com/RajeshRamadas/yolov8-model-optimization.git
+                    # Check if dataset already exists
+                    if [ -f "downloads/${OUTPUT_ZIP}" ] && [ -d "downloads/${EXTRACT_DIR}" ]; then
+                        echo "Dataset already exists. Skipping download."
+                        exit 0
                     fi
 
-                    # Verify repository was downloaded
-                    if [ ! -d "${MODEL_OPT_REPO}" ]; then
-                        echo "Failed to download model optimization repository!"
+                    # Install gdown for Google Drive downloads
+                    echo "Installing gdown..."
+                    pip install gdown
+
+                    # Download the file from Google Drive using gdown
+                    echo "Downloading dataset from Google Drive..."
+                    cd downloads
+                    python -m gdown https://drive.google.com/uc?id=${GDRIVE_FILE_ID} -O ${OUTPUT_ZIP}
+
+                    # Check if download was successful and file has content
+                    if [ ! -f "${OUTPUT_ZIP}" ]; then
+                        echo "Download failed! File not found."
                         exit 1
                     fi
 
-                    # Install requirements for the model optimization tools
-                    cd ${MODEL_OPT_REPO}
-                    if [ -f "requirements.txt" ]; then
-                        echo "Installing requirements for model optimization..."
-                        pip install -r requirements.txt
-                    else
-                        echo "No requirements.txt found, installing common YOLOv8 dependencies..."
-                        pip install ultralytics torch torchvision torchaudio
+                    # Verify file size
+                    FILE_SIZE=$(stat -c%s "${OUTPUT_ZIP}")
+                    if [ $FILE_SIZE -lt 10000 ]; then
+                        echo "Download appears incomplete. File size is only $FILE_SIZE bytes."
+                        echo "Content of the file:"
+                        head -c 1000 "${OUTPUT_ZIP}"
+                        exit 1
                     fi
 
-                    # Log repository information
-                    echo "Repository information:"
-                    git log -1 --pretty=format:"Last commit: %h by %an (%ad) - %s"
-
-                    cd ..
-                    echo "Model optimization repository setup complete."
-
-                    # Create a file listing all Python files for documentation
-                    mkdir -p ${ARTIFACT_DIR}
-                    find ${MODEL_OPT_REPO} -type f -name "*.py" | sort > ${ARTIFACT_DIR}/model_optimization_files.txt
+                    echo "Download completed successfully. File size: $FILE_SIZE bytes"
                 '''
 
-                // Archive repository info for reference
-                archiveArtifacts artifacts: 'artifacts/model_optimization_files.txt', fingerprint: true
+                // Archive the dataset as an artifact
+                archiveArtifacts artifacts: "downloads/dataset.zip", fingerprint: true, allowEmptyArchive: true
             }
         }
 
-        stage('Parallel Validation and Augmentation') {
-            parallel {
-                stage('Dataset Validation') {
-                    steps {
-                        sh '''#!/bin/bash -e
-                            # Activate virtual environment
-                            source ${VENV_NAME}/bin/activate
+        stage('Extract and Validate Dataset') {
+            when {
+                expression { !params.SKIP_DOWNLOAD }
+            }
+            steps {
+                sh '''#!/bin/bash -e
+                    # Move to downloads directory
+                    cd downloads
 
-                            # Create a directory for storing validation results
-                            mkdir -p ${ARTIFACT_DIR}/before_augmentation
+                    # Create extraction directory if it doesn't exist
+                    mkdir -p ${EXTRACT_DIR}
 
-                            # Read the data.yaml path
-                            DATA_YAML_PATH=$(cat downloads/data_yaml_path.txt)
+                    # Extract the zip file
+                    echo "Extracting dataset..."
+                    unzip -o ${OUTPUT_ZIP} -d ${EXTRACT_DIR}
 
-                            # Get the dataset directory path (parent directory of data.yaml)
-                            DATASET_DIR=$(dirname "${DATA_YAML_PATH}")
+                    # Find data.yaml file in the extracted directory
+                    echo "Locating data.yaml file..."
+                    DATA_YAML_PATH=$(find ${EXTRACT_DIR} -name "data.yaml" -type f | head -n 1)
 
-                            # Find dataset_validator.py in the model optimization repository
-                            VALIDATOR_PATH=$(find ${MODEL_OPT_REPO} -name "dataset_validator.py" -type f | head -n 1)
+                    if [ -z "${DATA_YAML_PATH}" ]; then
+                        echo "data.yaml not found in the extracted dataset!"
+                        echo "Contents of extraction directory:"
+                        ls -la ${EXTRACT_DIR}
+                        exit 1
+                    fi
 
-                            if [ -z "${VALIDATOR_PATH}" ]; then
-                                echo "dataset_validator.py not found in the model optimization repository!"
-                                exit 1
-                            fi
+                    # Get absolute path
+                    ABSOLUTE_PATH=$(readlink -f "${DATA_YAML_PATH}")
 
-                            echo "Found dataset_validator.py at: ${VALIDATOR_PATH}"
+                    # Save the path to a file
+                    echo "${ABSOLUTE_PATH}" > ${DATA_YAML_PATH_FILE}
 
-                            # Get the directory containing the validator script
-                            VALIDATOR_DIR=$(dirname "${VALIDATOR_PATH}")
+                    echo "data.yaml path saved: ${ABSOLUTE_PATH}"
 
-                            # Run the dataset validator with the specified parameters
-                            echo "Running dataset validation with parameters as specified..."
-                            cd "${VALIDATOR_DIR}"
-                            python dataset_validator.py --dataset_path "${DATASET_DIR}" --output_dir "${ARTIFACT_DIR}/before_augmentation" --yaml_path "${DATA_YAML_PATH}" --fail_on_issues --issue_threshold 10 --json_report
+                    # Display first few lines of data.yaml
+                    echo "First 5 lines of data.yaml:"
+                    head -n 5 "${ABSOLUTE_PATH}"
+                '''
 
-                            # Create zip file of the validation results
-                            echo "Creating zip file of validation results..."
-                            cd "${ARTIFACT_DIR}/before_augmentation" || exit 1
-                            zip -r validation_results.zip ./*
-
-                            # Copy the zip file to email artifacts directory
-                            cp validation_results.zip ${WORKSPACE}/email_artifacts/
-
-                            echo "Dataset validation completed. Results saved and zipped for email."
-                        '''
-
-                        // Archive validation results
-                        archiveArtifacts artifacts: 'artifacts/before_augmentation/**', fingerprint: true
-                        archiveArtifacts artifacts: 'email_artifacts/validation_results.zip', fingerprint: true
-                    }
-                }
-
-                stage('Targeted Augmentation') {
-                    when {
-                        expression { !params.SKIP_AUGMENTATION }
-                    }
-                    steps {
-                        sh '''#!/bin/bash -e
-                            # Activate virtual environment
-                            source ${VENV_NAME}/bin/activate
-
-                            # Read the data.yaml path
-                            DATA_YAML_PATH=$(cat downloads/data_yaml_path.txt)
-
-                            # Get the dataset directory path (parent directory of data.yaml)
-                            DATASET_DIR=$(dirname "${DATA_YAML_PATH}")
-
-                            # Find targeted_augmentation.py in the model optimization repository
-                            AUGMENTATION_PATH=$(find ${MODEL_OPT_REPO} -name "targeted_augmentation.py" -type f | head -n 1)
-
-                            if [ -z "${AUGMENTATION_PATH}" ]; then
-                                echo "targeted_augmentation.py not found in the model optimization repository!"
-                                exit 1
-                            fi
-
-                            echo "Found targeted_augmentation.py at: ${AUGMENTATION_PATH}"
-
-                            # Get the directory containing the augmentation script
-                            AUGMENTATION_DIR=$(dirname "${AUGMENTATION_PATH}")
-
-                            # Run the targeted augmentation with the specified parameters
-                            echo "Running targeted augmentation with parameters as specified..."
-                            cd "${AUGMENTATION_DIR}"
-                            python targeted_augmentation.py --dataset "${DATASET_DIR}" --output "augmented_dataset" --threshold 10 --factor 5
-
-                            # Save the absolute path to the augmentation directory for later stages
-                            AUG_DIR=$(pwd)
-                            echo "${AUG_DIR}" > ${AUGMENTATION_PATH_FILE}
-                            echo "Augmentation directory path saved: ${AUG_DIR}"
-
-                            # Create zip file of the augmented dataset results (only sample)
-                            echo "Creating zip file of augmented dataset sample..."
-                            cd "augmented_dataset" || exit 1
-
-                            # Only zip a small sample of files for email attachment
-                            mkdir -p sample
-                            # Copy a few images from each split for reference
-                            find . -name "*.jpg" | head -n 20 | xargs -I{} cp --parents {} sample/
-                            find . -name "*.txt" | head -n 20 | xargs -I{} cp --parents {} sample/
-                            # Make sure to include data.yaml
-                            cp -f data.yaml sample/
-
-                            cd sample
-                            zip -r augmented_dataset_sample.zip ./*
-                            cp augmented_dataset_sample.zip ${WORKSPACE}/email_artifacts/
-
-                            echo "Dataset augmentation completed. Augmented dataset sample saved for reference."
-
-                            # Copy data.yaml to a known location for later stages
-                            cp -f ${AUG_DIR}/augmented_dataset/data.yaml ${ARTIFACT_DIR}/augmented_data.yaml
-                        '''
-
-                        // Archive augmentation path for other stages
-                        archiveArtifacts artifacts: 'augmentation_dir_path.txt', fingerprint: true
-                        archiveArtifacts artifacts: 'artifacts/augmented_data.yaml', fingerprint: true
-                        archiveArtifacts artifacts: 'email_artifacts/augmented_dataset_sample.zip', fingerprint: true
-                    }
-                }
+                // Archive the path file as an artifact
+                archiveArtifacts artifacts: 'downloads/data_yaml_path.txt', fingerprint: true, allowEmptyArchive: true
             }
         }
 
-        stage('Post-Augmentation Validation') {
+        stage('Setup Repository') {
+            steps {
+                sh '''#!/bin/bash -e
+                    # Activate virtual environment
+                    source ${VENV_NAME}/bin/activate
+
+                    # Clone the knowledge distillation repository or create one if it doesn't exist
+                    if [ ! -d "${KD_REPO}" ]; then
+                        echo "Creating knowledge distillation directory..."
+                        mkdir -p ${KD_REPO}
+
+                        # Download knowledge_distillation.py script
+                        echo "Creating knowledge distillation script..."
+                        cat > ${KD_REPO}/knowledge_distillation.py << 'EOL'
+import torch
+import torch.nn.functional as F
+import os
+import argparse
+import logging
+import sys
+from ultralytics import YOLO
+from ultralytics.models.yolo.detect import DetectionTrainer
+from ultralytics.utils import DEFAULT_CFG
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('kd_training.log')
+    ]
+)
+logger = logging.getLogger('kd_trainer')
+
+class KDTrainer(DetectionTrainer):
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None, teacher_weights=None):
+        if overrides is None:
+            overrides = {}
+        super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
+
+        # Device handling
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+        # Load teacher model
+        self.teacher = YOLO(teacher_weights).model
+        self.teacher.eval().to(self.device)
+        for param in self.teacher.parameters():
+            param.requires_grad = False  # Freeze teacher
+
+        logger.info(f"Loaded teacher model from: {teacher_weights}")
+
+        # KD hyperparameters
+        self.alpha = float(overrides.get('alpha', 0.5))  # Weight for hard loss
+        self.temperature = float(overrides.get('temperature', 2.0))  # Temperature for softening
+        logger.info(f"KD parameters - Alpha: {self.alpha}, Temperature: {self.temperature}")
+
+    def get_distillation_loss(self, student_outputs, teacher_outputs, batch):
+        # Standard YOLO detection loss
+        hard_loss = self.criterion(student_outputs, batch)
+
+        # Initialize soft loss
+        soft_loss = 0
+        valid_outputs = 0
+
+        # Handle single output case
+        student_outputs = [student_outputs] if not isinstance(student_outputs, list) else student_outputs
+        teacher_outputs = [teacher_outputs] if not isinstance(teacher_outputs, list) else teacher_outputs
+
+        # Process each detection head
+        for s_out, t_out in zip(student_outputs, teacher_outputs):
+            if s_out.shape != t_out.shape:
+                continue
+
+            # Extract class predictions (YOLOv8 uses index 4 for class start)
+            s_cls = s_out[..., 4:]  # Shape: [batch, anchors, classes]
+            t_cls = t_out[..., 4:]
+
+            # Compute KL divergence with numerical stability
+            s_log_softmax = F.log_softmax(s_cls / self.temperature, dim=-1)
+            t_softmax = F.softmax(t_cls / self.temperature, dim=-1).detach()
+
+            # Clamp to avoid NaN
+            t_softmax = torch.clamp(t_softmax, min=1e-7, max=1.0)
+
+            soft_loss += F.kl_div(
+                s_log_softmax,
+                t_softmax,
+                reduction='batchmean'
+            ) * (self.temperature ** 2)
+            valid_outputs += 1
+
+        # Combine losses
+        if valid_outputs == 0:
+            return hard_loss  # Fallback if no matching outputs
+
+        return self.alpha * hard_loss + (1 - self.alpha) * (soft_loss / valid_outputs)
+
+    def training_step(self, batch):
+        # Move batch to device if needed
+        if batch['img'].device != self.device:
+            batch['img'] = batch['img'].to(self.device)
+
+        # Teacher forward pass (no gradients)
+        with torch.no_grad():
+            teacher_outputs = self.teacher(batch['img'])
+
+        # Student forward pass
+        student_outputs = self.model(batch['img'])
+
+        # Compute combined loss
+        loss = self.get_distillation_loss(student_outputs, teacher_outputs, batch)
+        return loss
+
+def train_student_model(cfg, teacher_weights):
+    """Train the student model with knowledge distillation"""
+    logger.info("="*50)
+    logger.info("TRAINING STUDENT MODEL WITH KNOWLEDGE DISTILLATION")
+    logger.info("="*50)
+
+    # Initialize and train
+    trainer = KDTrainer(overrides=cfg, teacher_weights=teacher_weights)
+    results = trainer.train()
+
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description='YOLOv8 Knowledge Distillation Training')
+
+    # Basic configuration
+    parser.add_argument('--data', type=str, required=True, help='Path to data.yaml')
+    parser.add_argument('--student_model', type=str, default='yolov8n.yaml', help='Student model configuration')
+    parser.add_argument('--teacher_model', type=str, default='yolov8x.yaml', help='Teacher model configuration')
+    parser.add_argument('--teacher_weights', type=str, required=True, help='Path to pre-trained teacher weights')
+
+    # Training parameters
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--batch', type=int, default=16, help='Batch size')
+    parser.add_argument('--imgsz', type=int, default=640, help='Image size')
+    parser.add_argument('--device', type=str, default='0', help='Training device (GPU ID or cpu)')
+    parser.add_argument('--workers', type=int, default=4, help='Number of dataloader workers')
+
+    # Knowledge distillation parameters
+    parser.add_argument('--alpha', type=float, default=0.5, help='Weight balance between hard and soft loss')
+    parser.add_argument('--temperature', type=float, default=2.0, help='Softening temperature for KD')
+
+    # Output naming
+    parser.add_argument('--student_name', type=str, default='yolov8n_kd', help='Student experiment name')
+
+    args = parser.parse_args()
+
+    # Create configuration dictionary
+    cfg = {
+        'model': args.student_model,
+        'data': args.data,
+        'epochs': args.epochs,
+        'imgsz': args.imgsz,
+        'batch': args.batch,
+        'device': args.device,
+        'workers': args.workers,
+        'name': args.student_name,
+        'alpha': args.alpha,
+        'temperature': args.temperature,
+    }
+
+    # Log configuration
+    logger.info("Configuration:")
+    for key, value in cfg.items():
+        logger.info(f"  {key}: {value}")
+
+    # Train student model
+    teacher_weights = args.teacher_weights
+    logger.info(f"Using pre-trained teacher weights: {teacher_weights}")
+
+    results = train_student_model(cfg, teacher_weights)
+
+    # Log results path
+    results_path = os.path.join('runs/detect', args.student_name, 'results.csv')
+    logger.info(f"Training completed. Results saved to: {results_path}")
+
+    return 0
+
+if __name__ == '__main__':
+    try:
+        exit_code = main()
+        sys.exit(exit_code)
+    except Exception as e:
+        logger.exception("An error occurred during training")
+        sys.exit(1)
+EOL
+
+                        echo "Creating analyze_results.py script..."
+                        cat > ${KD_REPO}/analyze_results.py << 'EOL'
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import json
+import argparse
+from pathlib import Path
+
+def analyze_kd_results(results_file, output_dir):
+    """Analyze knowledge distillation results and generate visualizations"""
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Read results
+    df = pd.read_csv(results_file)
+
+    # Print summary statistics
+    print("\n== Knowledge Distillation Parameter Study Summary ==")
+    print(f"Total experiments: {len(df)}")
+    print("\nBest models by different metrics:")
+
+    metrics = ['map50', 'map50_95', 'model_size_mb']
+    best_rows = {}
+
+    for metric in metrics:
+        if metric == 'model_size_mb':
+            # Lower is better for model size
+            idx = df[metric].idxmin()
+        else:
+            # Higher is better for accuracy metrics
+            idx = df[metric].idxmax()
+
+        best_rows[metric] = df.loc[idx]
+
+        if metric == 'model_size_mb':
+            print(f"\nBest for {metric}: alpha={best_rows[metric]['alpha']}, "
+                 f"temperature={best_rows[metric]['temperature']}, "
+                 f"value={best_rows[metric][metric]:.4f} MB")
+        else:
+            print(f"\nBest for {metric}: alpha={best_rows[metric]['alpha']}, "
+                 f"temperature={best_rows[metric]['temperature']}, "
+                 f"value={best_rows[metric][metric]:.4f}")
+
+    # Create normalized combined score (weighted average)
+    print("\nCalculating combined score (weighted average of normalized metrics)...")
+
+    # Normalize each metric to 0-1 range
+    for metric in metrics:
+        min_val = df[metric].min()
+        max_val = df[metric].max()
+
+        if max_val > min_val:
+            if metric == 'model_size_mb':
+                # For model size, smaller is better
+                df[f'{metric}_norm'] = (max_val - df[metric]) / (max_val - min_val)
+            else:
+                # For accuracy metrics, larger is better
+                df[f'{metric}_norm'] = (df[metric] - min_val) / (max_val - min_val)
+        else:
+            df[f'{metric}_norm'] = 0.5  # Default value if all models have same score
+
+    # Create combined score (weighted)
+    df['combined_score'] = (
+        df['map50_norm'] * 0.4 +
+        df['map50_95_norm'] * 0.4 +
+        df['model_size_mb_norm'] * 0.2
+    )
+
+    # Find best overall model
+    best_overall = df.loc[df['combined_score'].idxmax()]
+    print(f"\nBest overall model (combined score):")
+    print(f"  Alpha: {best_overall['alpha']}")
+    print(f"  Temperature: {best_overall['temperature']}")
+    print(f"  mAP@50: {best_overall['map50']:.4f}")
+    print(f"  mAP@50-95: {best_overall['map50_95']:.4f}")
+    print(f"  Model size: {best_overall['model_size_mb']:.2f} MB")
+    print(f"  Combined score: {best_overall['combined_score']:.4f}")
+    print(f"  Path: {best_overall['path']}")
+
+    # Save best model info
+    with open(os.path.join(output_dir, 'best_model.txt'), 'w') as f:
+        f.write(f"Best overall model:\n")
+        f.write(f"Alpha: {best_overall['alpha']}\n")
+        f.write(f"Temperature: {best_overall['temperature']}\n")
+        f.write(f"mAP@50: {best_overall['map50']:.4f}\n")
+        f.write(f"mAP@50-95: {best_overall['map50_95']:.4f}\n")
+        f.write(f"Model size: {best_overall['model_size_mb']:.2f} MB\n")
+        f.write(f"Combined score: {best_overall['combined_score']:.4f}\n")
+        f.write(f"Path: {best_overall['path']}\n")
+
+    # Create visualizations
+    print("\nGenerating visualizations...")
+
+    # Create heatmaps for each metric
+    for metric in metrics + ['combined_score']:
+        plt.figure(figsize=(10, 8))
+        pivot = df.pivot_table(values=metric, index='temperature', columns='alpha')
+
+        if metric == 'model_size_mb':
+            # For model size, use reverse colormap (smaller is better)
+            cmap = 'viridis_r'
+        else:
+            # For other metrics, use regular colormap (larger is better)
+            cmap = 'viridis'
+
+        sns.heatmap(pivot, annot=True, fmt='.4f', cmap=cmap)
+        plt.title(f'Impact of Alpha and Temperature on {metric}')
+        plt.xlabel('Alpha (weight of hard loss)')
+        plt.ylabel('Temperature')
+
+        # Save the plot
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'{metric}_heatmap.png'))
+        plt.close()
+
+    # Create parameter correlation plot
+    plt.figure(figsize=(10, 8))
+    corr = df[metrics + ['alpha', 'temperature', 'combined_score']].corr()
+    sns.heatmap(corr, annot=True, fmt='.2f', cmap='coolwarm')
+    plt.title('Parameter Correlation')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'parameter_correlation.png'))
+    plt.close()
+
+    # Save detailed report
+    with open(os.path.join(output_dir, 'parameter_study_report.md'), 'w') as f:
+        f.write('# Knowledge Distillation Parameter Study Report\n\n')
+
+        f.write('## Parameter Combinations Tested\n\n')
+        f.write('| Alpha | Temperature | mAP@50 | mAP@50-95 | Model Size (MB) | Combined Score |\n')
+        f.write('|-------|-------------|--------|-----------|-----------------|---------------|\n')
+
+        # Sort by combined score (descending)
+        for _, row in df.sort_values('combined_score', ascending=False).iterrows():
+            f.write(f"| {row['alpha']} | {row['temperature']} | {row['map50']:.4f} | {row['map50_95']:.4f} | {row['model_size_mb']:.2f} | {row['combined_score']:.4f} |\n")
+
+        f.write('\n## Best Parameters\n\n')
+
+        for metric in metrics:
+            if metric == 'model_size_mb':
+                best_row = df.loc[df[metric].idxmin()]
+                f.write(f"* Best for {metric}: alpha={best_row['alpha']}, temperature={best_row['temperature']} (value={best_row[metric]:.4f} MB)\n")
+            else:
+                best_row = df.loc[df[metric].idxmax()]
+                f.write(f"* Best for {metric}: alpha={best_row['alpha']}, temperature={best_row['temperature']} (value={best_row[metric]:.4f})\n")
+
+        f.write(f"* Best overall (combined score): alpha={best_overall['alpha']}, temperature={best_overall['temperature']} (score={best_overall['combined_score']:.4f})\n\n")
+
+        f.write('## Recommendations\n\n')
+        f.write(f"Based on this parameter study, the recommended settings for knowledge distillation on this dataset are:\n\n")
+        f.write(f"* **Alpha: {best_overall['alpha']}** - Controls the balance between hard loss (ground truth) and soft loss (teacher knowledge)\n")
+        f.write(f"* **Temperature: {best_overall['temperature']}** - Controls the softening of probability distributions\n\n")
+        f.write(f"These parameters provide the best balance between accuracy, speed, and model size.\n")
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze Knowledge Distillation Results")
+    parser.add_argument("--results", type=str, required=True, help="Path to results CSV file")
+    parser.add_argument("--output", type=str, default="analysis_results", help="Output directory for analysis results")
+
+    args = parser.parse_args()
+    analyze_kd_results(args.results, args.output)
+
+if __name__ == "__main__":
+    main()
+EOL
+                    else
+                        echo "Knowledge distillation repository directory already exists, updating scripts..."
+                    fi
+
+                    # Install any additional requirements for the knowledge distillation
+                    pip install ultralytics torch torchvision matplotlib pandas seaborn
+
+                    echo "Knowledge distillation repository setup complete."
+                '''
+            }
+        }
+
+        stage('Dataset Augmentation') {
             when {
                 expression { !params.SKIP_AUGMENTATION }
             }
@@ -377,757 +559,366 @@ pipeline {
                     # Activate virtual environment
                     source ${VENV_NAME}/bin/activate
 
-                    # Create directory for validation results
-                    mkdir -p ${ARTIFACT_DIR}/after_augmentation
+                    # Read the data.yaml path
+                    DATA_YAML_PATH=$(cat downloads/data_yaml_path.txt)
 
-                    # Read the augmentation directory path with error handling
-                    if [ -f "${AUGMENTATION_PATH_FILE}" ]; then
-                        AUG_DIR=$(cat ${AUGMENTATION_PATH_FILE})
-                        echo "Found augmentation directory path: ${AUG_DIR}"
-                    else
-                        echo "Warning: augmentation_dir_path.txt not found. Cannot continue."
-                        exit 1
-                    fi
+                    # Get the dataset directory path (parent directory of data.yaml)
+                    DATASET_DIR=$(dirname "${DATA_YAML_PATH}")
 
-                    # Define the augmented dataset directory with absolute path
-                    AUGMENTED_DATASET_DIR="${AUG_DIR}/augmented_dataset"
-                    echo "Augmented dataset directory: ${AUGMENTED_DATASET_DIR}"
+                    # Create augmented dataset directory
+                    AUGMENTATION_DIR="${WORKSPACE}/augmented_dataset"
+                    mkdir -p ${AUGMENTATION_DIR}
 
-                    # Check if the directory exists
-                    if [ ! -d "${AUGMENTED_DATASET_DIR}" ]; then
-                        echo "Error: Augmented dataset directory doesn't exist!"
-                        exit 1
-                    fi
+                    # Create a simple augmentation script
+                    cat > ${KD_REPO}/simple_augmentation.py << 'EOL'
+import os
+import shutil
+import random
+import cv2
+import numpy as np
+import argparse
+from pathlib import Path
+from tqdm import tqdm
+import yaml
 
-                    # Find dataset_validator.py in the model optimization repository
-                    VALIDATOR_PATH=$(find ${MODEL_OPT_REPO} -name "dataset_validator.py" -type f | head -n 1)
+def augment_image(img, bboxes, augment_type):
+    h, w, _ = img.shape
 
-                    if [ -z "${VALIDATOR_PATH}" ]; then
-                        echo "dataset_validator.py not found in the model optimization repository!"
-                        exit 1
-                    fi
+    if augment_type == 'flip':
+        # Horizontal flip
+        img = cv2.flip(img, 1)
+        # Adjust bounding boxes - x becomes 1-x
+        for box in bboxes:
+            box[1] = 1 - box[1]  # Flip x center
 
-                    echo "Found dataset_validator.py at: ${VALIDATOR_PATH}"
+    elif augment_type == 'brightness':
+        # Adjust brightness
+        factor = random.uniform(0.5, 1.5)
+        img = cv2.convertScaleAbs(img, alpha=factor, beta=0)
 
-                    # Get the directory containing the validator script
-                    VALIDATOR_DIR=$(dirname "${VALIDATOR_PATH}")
+    elif augment_type == 'contrast':
+        # Adjust contrast
+        factor = random.uniform(0.5, 1.5)
+        mean = np.mean(img)
+        img = (img - mean) * factor + mean
+        img = np.clip(img, 0, 255).astype(np.uint8)
 
-                    # Verify augmented dataset has its own data.yaml
-                    if [ ! -f "${AUGMENTED_DATASET_DIR}/data.yaml" ]; then
-                        echo "Error: data.yaml not found in augmented dataset. Cannot continue."
-                        exit 1
-                    fi
+    elif augment_type == 'rotate':
+        # Small rotation (±15 degrees)
+        angle = random.uniform(-15, 15)
+        M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
+        img = cv2.warpAffine(img, M, (w, h))
 
-                    AUGMENTED_YAML_PATH="${AUGMENTED_DATASET_DIR}/data.yaml"
-                    echo "Using augmented dataset's data.yaml: ${AUGMENTED_YAML_PATH}"
+        # Bounding box transformation is more complex
+        # Simplified approach: keep the boxes unchanged for small rotations
 
-                    # Run the dataset validator on the augmented dataset
-                    echo "Running post-augmentation validation..."
-                    cd "${VALIDATOR_DIR}"
+    return img, bboxes
 
-                    # Use absolute paths to ensure correct file locations
-                    python dataset_validator.py --dataset_path "${AUGMENTED_DATASET_DIR}" --output_dir "${ARTIFACT_DIR}/after_augmentation" --yaml_path "${AUGMENTED_YAML_PATH}" --fail_on_issues --issue_threshold 10 --json_report
+def augment_dataset(source_dir, output_dir, factor=2):
+    # Create output directory structure
+    os.makedirs(os.path.join(output_dir, 'images', 'train'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'images', 'val'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'labels', 'train'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'labels', 'val'), exist_ok=True)
 
-                    # Create zip file of the validation results
-                    echo "Creating zip file of post-augmentation validation results..."
-                    cd ${ARTIFACT_DIR}/after_augmentation || exit 1
-                    zip -r post_augmentation_validation.zip ./*
+    # Read data.yaml
+    data_yaml_path = os.path.join(source_dir, 'data.yaml')
+    if os.path.exists(data_yaml_path):
+        with open(data_yaml_path, 'r') as f:
+            data_yaml = yaml.safe_load(f)
+    else:
+        # Try to find data.yaml in parent directories
+        for parent in Path(source_dir).parents:
+            data_yaml_path = os.path.join(parent, 'data.yaml')
+            if os.path.exists(data_yaml_path):
+                with open(data_yaml_path, 'r') as f:
+                    data_yaml = yaml.safe_load(f)
+                break
+        else:
+            # Create default data.yaml if not found
+            data_yaml = {
+                'nc': 0,  # Will be updated based on labels
+                'names': [],
+                'train': './images/train',
+                'val': './images/val',
+                'test': ''
+            }
 
-                    echo "Post-augmentation dataset validation completed. Results saved."
+    # Find train/val image and label directories
+    img_train_dir = os.path.join(source_dir, 'images', 'train')
+    if not os.path.exists(img_train_dir):
+        img_train_dir = os.path.join(source_dir, 'train', 'images')
+
+    img_val_dir = os.path.join(source_dir, 'images', 'val')
+    if not os.path.exists(img_val_dir):
+        img_val_dir = os.path.join(source_dir, 'val', 'images')
+
+    label_train_dir = os.path.join(source_dir, 'labels', 'train')
+    if not os.path.exists(label_train_dir):
+        label_train_dir = os.path.join(source_dir, 'train', 'labels')
+
+    label_val_dir = os.path.join(source_dir, 'labels', 'val')
+    if not os.path.exists(label_val_dir):
+        label_val_dir = os.path.join(source_dir, 'val', 'labels')
+
+    # Make sure we found the directories
+    for dir_path in [img_train_dir, img_val_dir, label_train_dir, label_val_dir]:
+        if not os.path.exists(dir_path):
+            print(f"Warning: Directory not found: {dir_path}")
+            continue
+
+    # Copy original files to output directory first
+    for split in ['train', 'val']:
+        img_src_dir = img_train_dir if split == 'train' else img_val_dir
+        label_src_dir = label_train_dir if split == 'train' else label_val_dir
+
+        img_dst_dir = os.path.join(output_dir, 'images', split)
+        label_dst_dir = os.path.join(output_dir, 'labels', split)
+
+        if os.path.exists(img_src_dir):
+            print(f"Copying original {split} images...")
+            for img_file in tqdm(os.listdir(img_src_dir)):
+                if img_file.endswith(('.jpg', '.jpeg', '.png')):
+                    shutil.copy2(
+                        os.path.join(img_src_dir, img_file),
+                        os.path.join(img_dst_dir, img_file)
+                    )
+
+        if os.path.exists(label_src_dir):
+            print(f"Copying original {split} labels...")
+            for label_file in tqdm(os.listdir(label_src_dir)):
+                if label_file.endswith('.txt'):
+                    shutil.copy2(
+                        os.path.join(label_src_dir, label_file),
+                        os.path.join(label_dst_dir, label_file)
+                    )
+
+    # Augment only the training set
+    augment_types = ['flip', 'brightness', 'contrast', 'rotate']
+
+    # Get list of training images
+    train_img_dir = os.path.join(output_dir, 'images', 'train')
+    train_img_files = [f for f in os.listdir(train_img_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
+
+    print(f"Augmenting training set with factor {factor}...")
+    for i in range(factor - 1):  # -1 because we already copied the original files
+        for img_file in tqdm(train_img_files):
+            # Choose a random augmentation type
+            aug_type = random.choice(augment_types)
+
+            # Get corresponding label file
+            base_name = os.path.splitext(img_file)[0]
+            label_file = f"{base_name}.txt"
+            label_path = os.path.join(output_dir, 'labels', 'train', label_file)
+
+            # Check if label file exists
+            if not os.path.exists(label_path):
+                continue
+
+            # Read image
+            img_path = os.path.join(train_img_dir, img_file)
+            img = cv2.imread(img_path)
+            if img is None:
+                continue
+
+            # Read bounding boxes
+            bboxes = []
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        cls_id = int(parts[0])
+                        x_center = float(parts[1])
+                        y_center = float(parts[2])
+                        width = float(parts[3])
+                        height = float(parts[4])
+                        bboxes.append([cls_id, x_center, y_center, width, height])
+
+            # Apply augmentation
+            aug_img, aug_bboxes = augment_image(img, bboxes, aug_type)
+
+            # Save augmented image with a new name
+            aug_img_name = f"{base_name}_{aug_type}_{i}.jpg"
+            aug_img_path = os.path.join(train_img_dir, aug_img_name)
+            cv2.imwrite(aug_img_path, aug_img)
+
+            # Save augmented labels
+            aug_label_name = f"{base_name}_{aug_type}_{i}.txt"
+            aug_label_path = os.path.join(output_dir, 'labels', 'train', aug_label_name)
+            with open(aug_label_path, 'w') as f:
+                for box in aug_bboxes:
+                    f.write(f"{box[0]} {box[1]} {box[2]} {box[3]} {box[4]}\n")
+
+    # Update data.yaml
+    # Count classes from label files if not specified in original yaml
+    if data_yaml['nc'] == 0:
+        classes = set()
+        label_files = os.listdir(os.path.join(output_dir, 'labels', 'train'))
+        for label_file in label_files:
+            if label_file.endswith('.txt'):
+                with open(os.path.join(output_dir, 'labels', 'train', label_file), 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 5:
+                            classes.add(int(parts[0]))
+        data_yaml['nc'] = len(classes)
+
+    # Update paths in data.yaml
+    data_yaml['path'] = os.path.abspath(output_dir)
+    data_yaml['train'] = './images/train'
+    data_yaml['val'] = './images/val'
+
+    # Save updated data.yaml
+    with open(os.path.join(output_dir, 'data.yaml'), 'w') as f:
+        yaml.dump(data_yaml, f, default_flow_style=None)
+
+    print(f"Dataset augmentation completed. Augmented dataset saved to: {output_dir}")
+    print(f"Original dataset size: {len(train_img_files)} training images")
+    print(f"Augmented dataset size: {len(os.listdir(train_img_dir))} training images")
+
+def main():
+    parser = argparse.ArgumentParser(description="Simple dataset augmentation for YOLOv8")
+    parser.add_argument("--source", type=str, required=True, help="Source dataset directory")
+    parser.add_argument("--output", type=str, required=True, help="Output directory for augmented dataset")
+    parser.add_argument("--factor", type=int, default=2, help="Augmentation factor (how many times to augment)")
+
+    args = parser.parse_args()
+    augment_dataset(args.source, args.output, args.factor)
+
+if __name__ == "__main__":
+    main()
+EOL
+
+                    # Run the augmentation script
+                    echo "Running dataset augmentation..."
+                    python ${KD_REPO}/simple_augmentation.py --source "${DATASET_DIR}" --output "${AUGMENTATION_DIR}" --factor 2
+
+                    # Save the augmented dataset path
+                    echo "${AUGMENTATION_DIR}" > ${AUGMENTATION_PATH_FILE}
+                    echo "Augmentation directory path saved: ${AUGMENTATION_DIR}"
+
+                    # Copy the augmented data.yaml to artifacts
+                    cp -f ${AUGMENTATION_DIR}/data.yaml ${ARTIFACT_DIR}/augmented_data.yaml
+
+                    # Create a sample zip for artifacts
+                    echo "Creating zip file of augmented dataset sample..."
+                    cd "${AUGMENTATION_DIR}"
+                    mkdir -p sample
+                    find images/train -name "*.jpg" | head -n 10 | xargs -I{} cp --parents {} sample/
+                    find labels/train -name "*.txt" | head -n 10 | xargs -I{} cp --parents {} sample/
+                    cp -f data.yaml sample/
+                    cd sample
+                    zip -r augmented_dataset_sample.zip ./*
+                    cp augmented_dataset_sample.zip ${WORKSPACE}/email_artifacts/
+
+                    echo "Dataset augmentation completed."
                 '''
 
-                // Archive the validation results
-                archiveArtifacts artifacts: 'artifacts/after_augmentation/**', fingerprint: true
-                archiveArtifacts artifacts: 'artifacts/after_augmentation/post_augmentation_validation.zip', fingerprint: true
+                // Archive artifacts
+                archiveArtifacts artifacts: 'augmentation_dir_path.txt', fingerprint: true
+                archiveArtifacts artifacts: 'artifacts/augmented_data.yaml', fingerprint: true
+                archiveArtifacts artifacts: 'email_artifacts/augmented_dataset_sample.zip', fingerprint: true
             }
         }
 
-        stage('Neural Architecture Search (NAS)') {
-			steps {
-				// Pass parameters to shell script via environment variables
-				sh """
-					# Save parameters to environment files
-					echo "${params.NAS_TRIALS}" > nas_trials.txt
-					echo "${params.NAS_EPOCHS}" > nas_epochs.txt
-				"""
-
-				sh '''#!/bin/bash -e
-					# Activate virtual environment
-					source ${VENV_NAME}/bin/activate
-
-					# Read parameters from files
-					NAS_TRIALS=$(cat nas_trials.txt)
-					NAS_EPOCHS=$(cat nas_epochs.txt)
-
-					# Read the augmentation directory path with error handling
-					if [ -f "${AUGMENTATION_PATH_FILE}" ]; then
-						AUG_DIR=$(cat ${AUGMENTATION_PATH_FILE})
-						AUGMENTED_DATASET_DIR="${AUG_DIR}/augmented_dataset"
-					else
-						# Fallback to original dataset if augmentation wasn't done
-						DATA_YAML_PATH=$(cat downloads/data_yaml_path.txt)
-						AUGMENTED_DATASET_DIR=$(dirname "${DATA_YAML_PATH}")
-						echo "Warning: Using original dataset instead of augmented dataset."
-					fi
-
-					# Find main.py in the model optimization repository
-					MAIN_PY_PATH=$(find ${WORKSPACE}/${MODEL_OPT_REPO} -name "main.py" -type f | grep "neural_architecture_search" | head -n 1)
-
-					if [ -z "${MAIN_PY_PATH}" ]; then
-						echo "neural_architecture_search/main.py not found in the model optimization repository!"
-						exit 1
-					fi
-
-					echo "Found main.py at: ${MAIN_PY_PATH}"
-
-					# Find search_space.yaml file
-					SEARCH_SPACE_PATH=$(find ${WORKSPACE}/${MODEL_OPT_REPO} -name "search_space.yaml" -type f | head -n 1)
-
-					if [ -z "${SEARCH_SPACE_PATH}" ]; then
-						echo "search_space.yaml not found in the model optimization repository!"
-						exit 1
-					fi
-
-					echo "Found search_space.yaml at: ${SEARCH_SPACE_PATH}"
-
-					# Verify data.yaml exists
-					YAML_PATH="${AUGMENTED_DATASET_DIR}/data.yaml"
-					if [ ! -f "${YAML_PATH}" ]; then
-						echo "Warning: data.yaml not found in dataset directory. Using fallback."
-						YAML_PATH="${ARTIFACT_DIR}/augmented_data.yaml"
-
-						if [ ! -f "${YAML_PATH}" ]; then
-							echo "Error: Cannot find data.yaml for neural architecture search!"
-							exit 1
-						fi
-					fi
-
-					# Create results directory
-					mkdir -p ${WORKSPACE}/thorough_nas
-
-					# Run the neural architecture search
-					echo "Running neural architecture search with ${NAS_TRIALS} trials and ${NAS_EPOCHS} epochs..."
-
-					# Log start time for performance tracking
-					echo "NAS Start Time: $(date)" > ${ARTIFACT_DIR}/nas_timing.txt
-
-					# Run NAS with the specified parameters
-					python "${MAIN_PY_PATH}" \
-						--config "${SEARCH_SPACE_PATH}" \
-						--data "${YAML_PATH}" \
-						--trials ${NAS_TRIALS} \
-						--epochs ${NAS_EPOCHS} \
-						--results-dir "${WORKSPACE}/thorough_nas" \
-						--parallel 2 \
-						--objective combined \
-						--advanced-search
-
-					# Log end time
-					echo "NAS End Time: $(date)" >> ${ARTIFACT_DIR}/nas_timing.txt
-
-					# Create a summary of the best models
-					echo "Creating best models summary..."
-					if [ -f "${WORKSPACE}/thorough_nas/all_results.csv" ]; then
-						echo "Top 3 Models by Combined Score:" > ${ARTIFACT_DIR}/best_models.txt
-						head -n 1 "${WORKSPACE}/thorough_nas/all_results.csv" >> ${ARTIFACT_DIR}/best_models.txt
-						tail -n +2 "${WORKSPACE}/thorough_nas/all_results.csv" | sort -t, -k10 -nr | head -n 3 >> ${ARTIFACT_DIR}/best_models.txt
-					fi
-
-					# Zip the results (excluding large model files)
-					echo "Creating zip file of neural architecture search results..."
-					cd "${WORKSPACE}/thorough_nas" || exit 1
-
-					# Create a copy without large weight files for email
-					mkdir -p email_summary
-					cp -f *.csv email_summary/ || true
-					cp -f *.json email_summary/ || true
-					cp -f *.html email_summary/ || true
-					cp -r visualizations email_summary/ || true
-
-					# Zip the email summary
-					cd email_summary
-					zip -r nas_results_summary.zip ./*
-					cp nas_results_summary.zip ${WORKSPACE}/email_artifacts/
-
-					# Zip the full results (but exclude large weight files)
-					cd "${WORKSPACE}/thorough_nas"
-					find . -name "*.pt" -type f | xargs du -h | sort -hr > ${ARTIFACT_DIR}/model_sizes.txt
-					zip -r nas_results.zip ./* -x "*.pt"
-
-					echo "Neural architecture search completed. Results saved."
-				'''
-
-				// Archive NAS results and timing information
-				archiveArtifacts artifacts: 'thorough_nas/*.csv', fingerprint: true, allowEmptyArchive: true
-				archiveArtifacts artifacts: 'thorough_nas/*.html', fingerprint: true, allowEmptyArchive: true
-				archiveArtifacts artifacts: 'thorough_nas/*.json', fingerprint: true, allowEmptyArchive: true
-				archiveArtifacts artifacts: 'thorough_nas/visualizations/**', fingerprint: true, allowEmptyArchive: true
-				archiveArtifacts artifacts: 'email_artifacts/nas_results_summary.zip', fingerprint: true, allowEmptyArchive: true
-				archiveArtifacts artifacts: 'artifacts/nas_timing.txt', fingerprint: true, allowEmptyArchive: true
-				archiveArtifacts artifacts: 'artifacts/best_models.txt', fingerprint: true, allowEmptyArchive: true
-				archiveArtifacts artifacts: 'artifacts/model_sizes.txt', fingerprint: true, allowEmptyArchive: true
-			}
-		}
-
-        stage('Model Evaluation') {
-			steps {
-				sh '''#!/bin/bash -e
-					# Activate virtual environment
-					source ${VENV_NAME}/bin/activate
-
-					# The issue appears to be with the symlink in the reports directory
-					# First, remove the entire directory structure and recreate it
-					rm -rf ${MODEL_RESULT_DIR}
-					mkdir -p ${MODEL_RESULT_DIR}/reports
-					mkdir -p ${MODEL_RESULT_DIR}/evaluations/detect
-
-					# Create placeholder file
-					echo "<html><body><h1>Model Evaluation Report</h1><p>Placeholder report</p></body></html>" > ${MODEL_RESULT_DIR}/reports/latest_report.html
-
-					# Get augmented dataset path
-					if [ -f "${AUGMENTATION_PATH_FILE}" ]; then
-						AUG_DIR=$(cat ${AUGMENTATION_PATH_FILE})
-						AUGMENTED_DATASET_DIR="${AUG_DIR}/augmented_dataset"
-					else
-						# Fallback to original dataset
-						DATA_YAML_PATH=$(cat downloads/data_yaml_path.txt)
-						AUGMENTED_DATASET_DIR=$(dirname "${DATA_YAML_PATH}")
-						echo "Warning: Using original dataset instead of augmented dataset."
-					fi
-
-					# Find model_evaluation.py
-					EVALUATION_SCRIPT_PATH=$(find ${WORKSPACE}/${MODEL_OPT_REPO} -name "model_evaluation.py" -type f | head -n 1)
-
-					if [ -z "${EVALUATION_SCRIPT_PATH}" ]; then
-						echo "model_evaluation.py not found in the model optimization repository!"
-						echo "Using placeholder report for pipeline continuity."
-						exit 0
-					fi
-
-					echo "Found model_evaluation.py at: ${EVALUATION_SCRIPT_PATH}"
-
-					# Get the directory containing the evaluation script
-					EVALUATION_DIR=$(dirname "${EVALUATION_SCRIPT_PATH}")
-
-					# Verify NAS results and dataset
-					if [ ! -d "${WORKSPACE}/thorough_nas" ]; then
-						echo "thorough_nas directory not found! Creating a placeholder..."
-						mkdir -p "${WORKSPACE}/thorough_nas/trial_0"
-						touch "${WORKSPACE}/thorough_nas/trial_0/best.pt"
-					fi
-
-					# Ensure data.yaml exists
-					YAML_PATH="${AUGMENTED_DATASET_DIR}/data.yaml"
-					if [ ! -f "${YAML_PATH}" ]; then
-						echo "Warning: data.yaml not found in augmented dataset."
-						# Try to find or create a suitable data.yaml
-						if [ -f "${ARTIFACT_DIR}/augmented_data.yaml" ]; then
-							YAML_PATH="${ARTIFACT_DIR}/augmented_data.yaml"
-						else
-							# Create a basic one as a last resort
-							echo "Creating a basic data.yaml for evaluation..."
-							echo "path: ${AUGMENTED_DATASET_DIR}" > ${ARTIFACT_DIR}/basic_data.yaml
-							echo "train: images/train" >> ${ARTIFACT_DIR}/basic_data.yaml
-							echo "val: images/val" >> ${ARTIFACT_DIR}/basic_data.yaml
-							YAML_PATH="${ARTIFACT_DIR}/basic_data.yaml"
-						fi
-					fi
-
-					# Run the model evaluation
-					echo "Running model evaluation..."
-					cd "${EVALUATION_DIR}"
-
-					# Log start time
-					mkdir -p ${ARTIFACT_DIR}
-					echo "Evaluation Start Time: $(date)" > ${ARTIFACT_DIR}/evaluation_timing.txt
-
-					# Run the evaluation script with error handling - using set +e to prevent exit on error
-					set +e
-					python model_evaluation.py --models-dir "${WORKSPACE}/thorough_nas" --data "${YAML_PATH}"
-					EVAL_STATUS=$?
-					set -e
-
-					if [ $EVAL_STATUS -ne 0 ]; then
-						echo "Model evaluation failed with status $EVAL_STATUS, continuing with fallback..."
-					fi
-
-					# Log end time
-					echo "Evaluation End Time: $(date)" >> ${ARTIFACT_DIR}/evaluation_timing.txt
-
-					# Find and copy evaluation results
-					PERFORMANCE_DIR=""
-					if [ -d "${EVALUATION_DIR}/performance" ]; then
-						PERFORMANCE_DIR="${EVALUATION_DIR}/performance"
-					elif [ -d "${WORKSPACE}/performance" ]; then
-						PERFORMANCE_DIR="${WORKSPACE}/performance"
-					elif [ -d "performance" ]; then
-						PERFORMANCE_DIR="$(pwd)/performance"
-					fi
-
-					echo "Performance results directory: ${PERFORMANCE_DIR}"
-
-					# Copy performance data - IMPORTANT: Use find without problematic backslash
-					if [ -n "$PERFORMANCE_DIR" ] && [ -d "$PERFORMANCE_DIR" ]; then
-						echo "Copying evaluation results..."
-
-						# Instead of direct copy, use find to copy files individually (fixed syntax)
-						find ${PERFORMANCE_DIR} -type f | while read file; do
-							# Skip copying latest_report.html symlink
-							if [[ "$file" == *"latest_report.html" ]]; then
-								echo "Skipping symlink file: $file"
-								continue
-							fi
-
-							# Get relative path
-							rel_path=${file#$PERFORMANCE_DIR/}
-							# Create target directory
-							target_dir=$(dirname "${MODEL_RESULT_DIR}/$rel_path")
-							mkdir -p "$target_dir"
-							# Copy file
-							cp "$file" "${MODEL_RESULT_DIR}/$rel_path"
-						done
-
-						# If we find a real report HTML file, use it
-						REAL_REPORT=$(find ${PERFORMANCE_DIR} -name "*report*.html" | grep -v "latest_report.html" | head -1)
-						if [ -n "$REAL_REPORT" ]; then
-							echo "Found report file: $REAL_REPORT - using as latest_report.html"
-							cp "$REAL_REPORT" "${MODEL_RESULT_DIR}/reports/latest_report.html"
-						fi
-					else
-						echo "Warning: Could not find performance results directory."
-					fi
-
-					# Ensure the latest_report.html exists
-					if [ ! -f "${MODEL_RESULT_DIR}/reports/latest_report.html" ]; then
-						echo "Creating a fallback report file..."
-						echo "<html><body><h1>Model Evaluation Report</h1><p>Fallback report created at $(date)</p></body></html>" > ${MODEL_RESULT_DIR}/reports/latest_report.html
-					fi
-
-					# Create evaluation summary
-					echo "Creating evaluation summary..."
-					echo "Evaluation completed at $(date)" > ${MODEL_RESULT_DIR}/evaluation_summary.txt
-					echo "Jenkins build: ${BUILD_NUMBER}" >> ${MODEL_RESULT_DIR}/evaluation_summary.txt
-
-					# Find and list best models
-					if [ -d "${WORKSPACE}/thorough_nas" ]; then
-						echo "Models found:" >> ${MODEL_RESULT_DIR}/evaluation_summary.txt
-						find "${WORKSPACE}/thorough_nas" -name "*.pt" | sort >> ${MODEL_RESULT_DIR}/evaluation_summary.txt
-					fi
-
-					# Create placeholder for JSON files
-					mkdir -p ${MODEL_RESULT_DIR}/evaluations/detect
-					touch ${MODEL_RESULT_DIR}/evaluations/detect/best_eval_results.json
-
-					# Zip the evaluation results
-					echo "Creating zip file of model evaluation results..."
-					cd ${MODEL_RESULT_DIR}
-					zip -r model_evaluation_results.zip .
-
-					# Create email artifacts directory if it doesn't exist
-					mkdir -p ${WORKSPACE}/email_artifacts
-
-					# Copy the zip to email artifacts
-					cp model_evaluation_results.zip ${WORKSPACE}/email_artifacts/ || echo "Failed to copy zip, but continuing"
-
-					echo "Model evaluation completed. Results saved."
-
-					# Final verification
-					ls -la ${MODEL_RESULT_DIR}/reports/
-				'''
-
-				// Archive the evaluation results with allowEmptyArchive to prevent failures
-				archiveArtifacts artifacts: 'model_evaluation_results/**', fingerprint: true, allowEmptyArchive: true
-				archiveArtifacts artifacts: 'email_artifacts/model_evaluation_results.zip', fingerprint: true, allowEmptyArchive: true
-				archiveArtifacts artifacts: 'artifacts/evaluation_timing.txt', fingerprint: true, allowEmptyArchive: true
-			}
-		}
-
-		stage('Knowledge Distillation') {
-    steps {
-        sh '''#!/bin/bash -e
-            # Activate virtual environment
-            source ${VENV_NAME}/bin/activate
-
-            # Find the best model from NAS to use as the student model
-            STUDENT_MODEL_BASE=""
-
-            # Create debug logs directory
-            mkdir -p ${WORKSPACE}/debug_logs
-
-            # Debug log to check best_model.json
-            echo "Searching for best_model.json..." > ${WORKSPACE}/debug_logs/kd_debug.log
-            find ${WORKSPACE} -name "best_model.json" >> ${WORKSPACE}/debug_logs/kd_debug.log
-
-            # Set default values in case we can't find or extract them
-            DEPTH_MULTIPLE=0.33
-            WIDTH_MULTIPLE=0.25
-            KERNEL_SIZE=3
-            IMG_SIZE=640
-
-            # Try to find the best model from the NAS results
-            if [ -f "${WORKSPACE}/thorough_nas/best_model.json" ]; then
-                echo "Found best_model.json at ${WORKSPACE}/thorough_nas/best_model.json" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                # Also print the content for debugging
-                echo "Content of best_model.json:" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                cat "${WORKSPACE}/thorough_nas/best_model.json" >> ${WORKSPACE}/debug_logs/kd_debug.log
-
-                TRIAL_NUM=$(grep -o '"trial_id": [0-9]*' ${WORKSPACE}/thorough_nas/best_model.json | awk '{print $2}')
-                if [ -z "$TRIAL_NUM" ]; then
-                    TRIAL_NUM=$(grep -o '"trial": [0-9]*' ${WORKSPACE}/thorough_nas/best_model.json | awk '{print $2}')
-                fi
-                echo "Extracted TRIAL_NUM: ${TRIAL_NUM}" >> ${WORKSPACE}/debug_logs/kd_debug.log
-
-                if [ -n "$TRIAL_NUM" ] && [ -d "${WORKSPACE}/thorough_nas/trial_${TRIAL_NUM}" ]; then
-                    # We'll pass the model architecture parameters, not the weights
-                    # Get the model params from the best_model.json
-                    STUDENT_MODEL_BASE="${WORKSPACE}/thorough_nas/trial_${TRIAL_NUM}"
-                    echo "Found best NAS model architecture from trial ${TRIAL_NUM} to use as student base"
-
-                    # Extract important parameters for the student model - with error handling
-                    python -c "
-import json
-import os
-import sys
-
-try:
-    with open('${WORKSPACE}/thorough_nas/best_model.json', 'r') as f:
-        data = json.load(f)
-
-    # Print the data structure for debugging
-    print('JSON data structure:', file=sys.stderr)
-    print(data, file=sys.stderr)
-
-    # Extract params with defaults if not found
-    params = data.get('params', {})
-    depth_multiple = params.get('depth_multiple', 0.33)
-    width_multiple = params.get('width_multiple', 0.25)
-    kernel_size = params.get('kernel_size', 3)
-    img_size = params.get('img_size', 640)
-
-    # Print extracted values
-    print(f'Extracted values - depth: {depth_multiple}, width: {width_multiple}, kernel: {kernel_size}, img: {img_size}', file=sys.stderr)
-
-    # Save to files for shell script to read
-    with open('/tmp/depth_multiple.txt', 'w') as f:
-        f.write(str(depth_multiple))
-    with open('/tmp/width_multiple.txt', 'w') as f:
-        f.write(str(width_multiple))
-    with open('/tmp/kernel_size.txt', 'w') as f:
-        f.write(str(kernel_size))
-    with open('/tmp/img_size.txt', 'w') as f:
-        f.write(str(img_size))
-
-    print(f'Extracted NAS parameters: depth={depth_multiple}, width={width_multiple}, kernel={kernel_size}, img_size={img_size}')
-except Exception as e:
-    print(f'Error extracting parameters: {e}', file=sys.stderr)
-    # Write default values to files
-    with open('/tmp/depth_multiple.txt', 'w') as f:
-        f.write('0.33')
-    with open('/tmp/width_multiple.txt', 'w') as f:
-        f.write('0.25')
-    with open('/tmp/kernel_size.txt', 'w') as f:
-        f.write('3')
-    with open('/tmp/img_size.txt', 'w') as f:
-        f.write('640')
-    print('Using default parameters due to error')
-" 2>> ${WORKSPACE}/debug_logs/kd_debug.log
-
-                    # Read parameters from files with verification
-                    if [ -f "/tmp/depth_multiple.txt" ]; then
-                        DEPTH_MULTIPLE=$(cat /tmp/depth_multiple.txt)
-                        echo "Read DEPTH_MULTIPLE: ${DEPTH_MULTIPLE}" >> ${WORKSPACE}/debug_logs/kd_debug.log
+        stage('Knowledge Distillation Parameter Study') {
+            steps {
+                sh '''#!/bin/bash -e
+                    # Activate virtual environment
+                    source ${VENV_NAME}/bin/activate
+
+                    # Get dataset path (augmented or original)
+                    if [ -f "${AUGMENTATION_PATH_FILE}" ]; then
+                        DATASET_DIR=$(cat ${AUGMENTATION_PATH_FILE})
+                        YAML_PATH="${DATASET_DIR}/data.yaml"
                     else
-                        echo "Warning: /tmp/depth_multiple.txt not found. Using default." >> ${WORKSPACE}/debug_logs/kd_debug.log
-                        DEPTH_MULTIPLE=0.33
+                        # Fallback to original dataset
+                        DATA_YAML_PATH=$(cat downloads/data_yaml_path.txt)
+                        YAML_PATH="${DATA_YAML_PATH}"
                     fi
 
-                    if [ -f "/tmp/width_multiple.txt" ]; then
-                        WIDTH_MULTIPLE=$(cat /tmp/width_multiple.txt)
-                        echo "Read WIDTH_MULTIPLE: ${WIDTH_MULTIPLE}" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                    else
-                        echo "Warning: /tmp/width_multiple.txt not found. Using default." >> ${WORKSPACE}/debug_logs/kd_debug.log
-                        WIDTH_MULTIPLE=0.25
-                    fi
+                    echo "Using dataset YAML: ${YAML_PATH}"
 
-                    if [ -f "/tmp/kernel_size.txt" ]; then
-                        KERNEL_SIZE=$(cat /tmp/kernel_size.txt)
-                        echo "Read KERNEL_SIZE: ${KERNEL_SIZE}" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                    else
-                        echo "Warning: /tmp/kernel_size.txt not found. Using default." >> ${WORKSPACE}/debug_logs/kd_debug.log
-                        KERNEL_SIZE=3
-                    fi
+                    # Create directory for knowledge distillation results
+                    mkdir -p ${KD_RESULT_DIR}
 
-                    if [ -f "/tmp/img_size.txt" ]; then
-                        IMG_SIZE=$(cat /tmp/img_size.txt)
-                        echo "Read IMG_SIZE: ${IMG_SIZE}" >> ${WORKSPACE}/debug_logs/kd_debug.log
-                    else
-                        echo "Warning: /tmp/img_size.txt not found. Using default." >> ${WORKSPACE}/debug_logs/kd_debug.log
-                        IMG_SIZE=640
-                    fi
+                    # Log start time for performance tracking
+                    echo "KD Start Time: $(date)" > ${ARTIFACT_DIR}/kd_timing.txt
 
-                    echo "Using NAS best architecture with depth_multiple: ${DEPTH_MULTIPLE}, width_multiple: ${WIDTH_MULTIPLE}, kernel_size: ${KERNEL_SIZE}, img_size: ${IMG_SIZE}"
-                fi
-            else
-                echo "No best_model.json found from NAS. Will use default yolov8n.yaml as student base." >> ${WORKSPACE}/debug_logs/kd_debug.log
-                STUDENT_MODEL_BASE="yolov8n.yaml"
-                echo "Using default parameters: depth_multiple=${DEPTH_MULTIPLE}, width_multiple=${WIDTH_MULTIPLE}, kernel_size=${KERNEL_SIZE}, img_size=${IMG_SIZE}"
-            fi
+                    # Define different alpha and temperature combinations to try
+                    ALPHAS=(0.3 0.5 0.7)
+                    TEMPERATURES=(1.0 2.0 3.0)
 
-            # Read the augmentation directory path with error handling
-            if [ -f "${AUGMENTATION_PATH_FILE}" ]; then
-                AUG_DIR=$(cat ${AUGMENTATION_PATH_FILE})
-                AUGMENTED_DATASET_DIR="${AUG_DIR}/augmented_dataset"
-            else
-                # Fallback to original dataset
-                DATA_YAML_PATH=$(cat downloads/data_yaml_path.txt)
-                AUGMENTED_DATASET_DIR=$(dirname "${DATA_YAML_PATH}")
-                echo "Warning: Using original dataset instead of augmented dataset."
-            fi
+                    echo "Training multiple student models with different alpha and temperature combinations..."
 
-            # Verify data.yaml exists
-            YAML_PATH="${AUGMENTED_DATASET_DIR}/data.yaml"
-            if [ ! -f "${YAML_PATH}" ]; then
-                echo "Warning: data.yaml not found in dataset directory. Using fallback."
-                YAML_PATH="${ARTIFACT_DIR}/augmented_data.yaml"
+                    # Create results tracking file
+                    RESULTS_FILE="${KD_RESULT_DIR}/parameter_comparison.csv"
+                    echo "alpha,temperature,map50,map50_95,model_size_mb,path" > $RESULTS_FILE
 
-                if [ ! -f "${YAML_PATH}" ]; then
-                    echo "Error: Cannot find data.yaml for knowledge distillation!"
-                    exit 1
-                fi
-            fi
+                    # Download pre-trained teacher model
+                    echo "Downloading pre-trained teacher model: ${params.TEACHER_MODEL}.pt"
+                    python -c "from ultralytics import YOLO; YOLO('${params.TEACHER_MODEL}.pt')"
+                    TEACHER_PATH=$(find ~/.cache -name "${params.TEACHER_MODEL}.pt" | head -1)
 
-            # Load class count from YAML
-            NC=$(python -c "
-import yaml
-try:
-    with open('${YAML_PATH}', 'r') as f:
-        data = yaml.safe_load(f)
-    print(data.get('nc', 80))
-except Exception as e:
-    print(80)  # Default if an error occurs
-")
-
-            # Create a directory for knowledge distillation results
-            mkdir -p ${WORKSPACE}/kd_results
-
-            # Create a custom student model config using NAS parameters
-            echo "Creating custom student model config with NAS parameters..."
-            STUDENT_CONFIG="${WORKSPACE}/kd_results/nas_student_model.yaml"
-
-            # Use Python to create the config file with kernel_size included
-            python -c "
-import yaml
-import copy
-import sys
-
-# Validate parameters - ensure they're numeric
-try:
-    NC = int('${NC}')
-    DEPTH_MULTIPLE = float('${DEPTH_MULTIPLE}')
-    WIDTH_MULTIPLE = float('${WIDTH_MULTIPLE}')
-    KERNEL_SIZE = int('${KERNEL_SIZE}')
-    print(f'Using parameters: NC={NC}, depth={DEPTH_MULTIPLE}, width={WIDTH_MULTIPLE}, kernel={KERNEL_SIZE}', file=sys.stderr)
-except ValueError as e:
-    print(f'Error converting parameters to numeric values: {e}', file=sys.stderr)
-    print('Using default values instead', file=sys.stderr)
-    NC = 80
-    DEPTH_MULTIPLE = 0.33
-    WIDTH_MULTIPLE = 0.25
-    KERNEL_SIZE = 3
-
-# Base configuration from yolov8n.yaml
-try:
-    from ultralytics.models.yolo import yolov8n
-    base_model = yolov8n.yaml
-    base_config = copy.deepcopy(base_model)
-    print('Successfully imported yolov8n base model', file=sys.stderr)
-except Exception as e:
-    print(f'Error importing yolov8n: {e}', file=sys.stderr)
-    # Fallback if we can't import directly
-    base_config = {
-        'nc': NC,
-        'depth_multiple': DEPTH_MULTIPLE,
-        'width_multiple': WIDTH_MULTIPLE,
-        'backbone': [
-            # [from, repeats, module, args]
-            [-1, 1, 'Conv', [64, 3, 2]],  # 0-P1/2
-            [-1, 1, 'Conv', [128, 3, 2]],  # 1-P2/4
-            [-1, 3, 'C2f', [128, True]],
-            [-1, 1, 'Conv', [256, 3, 2]],  # 3-P3/8
-            [-1, 6, 'C2f', [256, True]],
-            [-1, 1, 'Conv', [512, 3, 2]],  # 5-P4/16
-            [-1, 6, 'C2f', [512, True]],
-            [-1, 1, 'Conv', [1024, 3, 2]],  # 7-P5/32
-            [-1, 3, 'C2f', [1024, True]],
-            [-1, 1, 'SPPF', [1024, 5]],  # 9
-        ],
-        'head': [
-            [-1, 1, 'nn.Upsample', [None, 2, 'nearest']],
-            [[-1, 6], 1, 'Concat', [1]],  # cat backbone P4
-            [-1, 3, 'C2f', [512]],  # 12
-
-            [-1, 1, 'nn.Upsample', [None, 2, 'nearest']],
-            [[-1, 4], 1, 'Concat', [1]],  # cat backbone P3
-            [-1, 3, 'C2f', [256]],  # 15 (P3/8-small)
-
-            [-1, 1, 'Conv', [256, 3, 2]],
-            [[-1, 12], 1, 'Concat', [1]],  # cat head P4
-            [-1, 3, 'C2f', [512]],  # 18 (P4/16-medium)
-
-            [-1, 1, 'Conv', [512, 3, 2]],
-            [[-1, 9], 1, 'Concat', [1]],  # cat head P5
-            [-1, 3, 'C2f', [1024]],  # 21 (P5/32-large)
-
-            [[15, 18, 21], 1, 'Detect', ['nc', 3]],  # Detect(P3, P4, P5)
-        ]
-    }
-
-# Apply NAS parameters
-config = {
-    'nc': NC,
-    'depth_multiple': DEPTH_MULTIPLE,
-    'width_multiple': WIDTH_MULTIPLE
-}
-
-# Copy backbone and head from base config
-config['backbone'] = base_config.get('backbone', [])
-config['head'] = base_config.get('head', [])
-
-# Apply kernel_size to appropriate Conv layers
-kernel_size = KERNEL_SIZE
-for section in ['backbone', 'head']:
-    for layer in config[section]:
-        if 'Conv' in layer[2]:  # Only for Conv modules
-            if len(layer) > 3 and isinstance(layer[3], list) and len(layer[3]) >= 2:
-                # Replace kernel size in Conv layers [channels, kernel, stride]
-                if len(layer[3]) >= 3 and isinstance(layer[3], list):
-                    # Make sure we're not modifying the stride
-                    original_stride = layer[3][2] if len(layer[3]) > 2 else 1
-                    layer[3][1] = kernel_size  # Set kernel size
-                    if len(layer[3]) > 2:
-                        layer[3][2] = original_stride  # Preserve stride
-
-try:
-    with open('${STUDENT_CONFIG}', 'w') as f:
-        yaml.dump(config, f, default_flow_style=None)
-    print(f'Created custom student config at ${STUDENT_CONFIG} with kernel_size={kernel_size}')
-except Exception as e:
-    print(f'Error creating student config: {e}', file=sys.stderr)
-" 2>> ${WORKSPACE}/debug_logs/kd_debug.log
-
-            # Log start time for performance tracking
-            echo "KD Start Time: $(date)" > ${ARTIFACT_DIR}/kd_timing.txt
-
-            # Define different alpha and temperature combinations to try
-            # This will create a grid of different parameter combinations
-            ALPHAS=(0.3 0.5 0.7)
-            TEMPERATURES=(1.0 2.0 3.0)
-
-            echo "Training multiple student models with different alpha and temperature combinations..."
-
-            # Create results tracking file
-            RESULTS_FILE="${WORKSPACE}/kd_results/parameter_comparison.csv"
-            echo "alpha,temperature,map50,map50_95,fps,model_size_mb,path" > $RESULTS_FILE
-
-            # Store the best model details
-            BEST_MAP=0
-            BEST_MODEL_PATH=""
-            BEST_ALPHA=0
-            BEST_TEMP=0
-
-            # Train multiple models with different parameter combinations
-            for ALPHA in "${ALPHAS[@]}"; do
-                for TEMP in "${TEMPERATURES[@]}"; do
-                    echo "=================================================================="
-                    echo "Training student model with alpha=${ALPHA}, temperature=${TEMP}"
-                    echo "=================================================================="
-
-                    # Set the model name with parameters in it
-                    STUDENT_NAME="yolov8_nas_kd_a${ALPHA}_t${TEMP}_${BUILD_NUMBER}"
-                    STUDENT_NAME_SAFE=$(echo $STUDENT_NAME | tr '.' '_')
-
-                    # Run the knowledge distillation with this parameter combination
-                    set +e  # Don't exit on error
-                    python ${MODEL_OPT_REPO}/knowledge_distillation.py \
-                        --data "${YAML_PATH}" \
-                        --teacher_model "yolov8x.yaml" \
-                        --student_model "${STUDENT_CONFIG}" \
-                        --epochs 10 \
-                        --batch 16 \
-                        --imgsz ${IMG_SIZE} \
-                        --student_name "${STUDENT_NAME_SAFE}" \
-                        --alpha ${ALPHA} \
-                        --temperature ${TEMP}
-                    KD_STATUS=$?
-                    set -e  # Restore exit on error
-
-                    if [ $KD_STATUS -ne 0 ]; then
-                        echo "Warning: Knowledge distillation for alpha=${ALPHA}, temperature=${TEMP} failed with status ${KD_STATUS}. Continuing with next combination."
-                        continue
-                    fi
-
-                    # Find the student model path
-                    STUDENT_MODEL_PATH=$(find ${WORKSPACE}/runs/detect -name "best.pt" | grep "${STUDENT_NAME_SAFE}" | head -1)
-
-                    if [ ! -f "$STUDENT_MODEL_PATH" ]; then
-                        echo "Warning: Couldn't find model for alpha=${ALPHA}, temperature=${TEMP}"
-                        continue
-                    fi
-
-                    # Create a copy of the student model with parameters in the name
-                    mkdir -p ${WORKSPACE}/kd_results/models
-                    MODEL_COPY="${WORKSPACE}/kd_results/models/student_a${ALPHA}_t${TEMP}.pt"
-                    cp "${STUDENT_MODEL_PATH}" "${MODEL_COPY}"
-
-                    # Evaluate the student model
-                    echo "Evaluating student model with alpha=${ALPHA}, temperature=${TEMP}..."
-
-                    # Find model_evaluation.py script
-                    EVALUATION_SCRIPT_PATH=$(find ${WORKSPACE}/${MODEL_OPT_REPO} -name "model_evaluation.py" -type f | head -1)
-
-                    if [ -z "${EVALUATION_SCRIPT_PATH}" ]; then
-                        echo "model_evaluation.py not found - using fallback evaluation method"
-                        # Fallback evaluation using ultralytics
+                    if [ -z "$TEACHER_PATH" ]; then
+                        echo "Teacher model not found in cache, downloading..."
+                        mkdir -p ${KD_RESULT_DIR}/models
                         python -c "
 from ultralytics import YOLO
-import json
-import os
-
-model = YOLO('${STUDENT_MODEL_PATH}')
-results = model.val(data='${YAML_PATH}')
-
-metrics = {
-    'map50': float(results.box.map50),
-    'map50_95': float(results.box.map),
-    'model_size_mb': os.path.getsize('${STUDENT_MODEL_PATH}') / (1024 * 1024),
-    'fps': 0  # Can't measure FPS directly
-}
-
-with open('/tmp/model_metrics.json', 'w') as f:
-    json.dump(metrics, f)
+model = YOLO('${params.TEACHER_MODEL}.pt')
+model.save('${KD_RESULT_DIR}/models/${params.TEACHER_MODEL}.pt')
 "
-                        # Read the metrics
-                        METRICS=$(cat /tmp/model_metrics.json)
-                        MAP50=$(echo $METRICS | python -c "import json, sys; print(json.load(sys.stdin)['map50'])")
-                        MAP50_95=$(echo $METRICS | python -c "import json, sys; print(json.load(sys.stdin)['map50_95'])")
-                        MODEL_SIZE=$(echo $METRICS | python -c "import json, sys; print(json.load(sys.stdin)['model_size_mb'])")
-                        FPS=0
-                    else
-                        # Use the evaluation script
-                        EVAL_OUTPUT_DIR="${WORKSPACE}/kd_results/evaluations/${STUDENT_NAME_SAFE}"
-                        mkdir -p "${EVAL_OUTPUT_DIR}"
+                        TEACHER_PATH="${KD_RESULT_DIR}/models/${params.TEACHER_MODEL}.pt"
+                    fi
 
-                        set +e  # Don't exit on error
-                        python "${EVALUATION_SCRIPT_PATH}" \
-                            --model "${STUDENT_MODEL_PATH}" \
-                            --data "${YAML_PATH}" \
-                            --output-dir "${EVAL_OUTPUT_DIR}"
-                        EVAL_STATUS=$?
-                        set -e  # Restore exit on error
+                    echo "Using teacher model: ${TEACHER_PATH}"
 
-                        if [ $EVAL_STATUS -ne 0 ]; then
-                            echo "Warning: Evaluation for student model with alpha=${ALPHA}, temperature=${TEMP} failed. Using fallback."
-                            # Fallback evaluation
+                    # Train multiple models with different parameter combinations
+                    for ALPHA in "${ALPHAS[@]}"; do
+                        for TEMP in "${TEMPERATURES[@]}"; do
+                            echo "=================================================================="
+                            echo "Training student model with alpha=${ALPHA}, temperature=${TEMP}"
+                            echo "=================================================================="
+
+                            # Set the model name with parameters in it
+                            STUDENT_NAME="yolov8_kd_a${ALPHA}_t${TEMP}_${BUILD_NUMBER}"
+                            STUDENT_NAME_SAFE=$(echo $STUDENT_NAME | tr '.' '_')
+
+                            # Run knowledge distillation with this parameter combination
+                            set +e  # Don't exit on error
+                            python ${KD_REPO}/knowledge_distillation.py \
+                                --data "${YAML_PATH}" \
+                                --teacher_model "${TEACHER_PATH}" \
+                                --student_model "${params.STUDENT_MODEL}.yaml" \
+                                --epochs ${params.KD_EPOCHS} \
+                                --batch 16 \
+                                --imgsz 640 \
+                                --student_name "${STUDENT_NAME_SAFE}" \
+                                --alpha ${ALPHA} \
+                                --temperature ${TEMP}
+                            KD_STATUS=$?
+                            set -e  # Restore exit on error
+
+                            if [ $KD_STATUS -ne 0 ]; then
+                                echo "Warning: Knowledge distillation for alpha=${ALPHA}, temperature=${TEMP} failed with status ${KD_STATUS}. Continuing with next combination."
+                                continue
+                            fi
+
+                            # Find the student model path
+                            STUDENT_MODEL_PATH=$(find ${WORKSPACE}/runs/detect -name "best.pt" | grep "${STUDENT_NAME_SAFE}" | head -1)
+
+                            if [ ! -f "$STUDENT_MODEL_PATH" ]; then
+                                echo "Warning: Couldn't find model for alpha=${ALPHA}, temperature=${TEMP}"
+                                continue
+                            fi
+
+                            # Create a copy of the student model with parameters in the name
+                            mkdir -p ${KD_RESULT_DIR}/models
+                            MODEL_COPY="${KD_RESULT_DIR}/models/student_a${ALPHA}_t${TEMP}.pt"
+                            cp "${STUDENT_MODEL_PATH}" "${MODEL_COPY}"
+
+                            # Evaluate the student model
+                            echo "Evaluating student model with alpha=${ALPHA}, temperature=${TEMP}..."
                             python -c "
 from ultralytics import YOLO
 import json
@@ -1139,602 +930,361 @@ results = model.val(data='${YAML_PATH}')
 metrics = {
     'map50': float(results.box.map50),
     'map50_95': float(results.box.map),
-    'model_size_mb': os.path.getsize('${STUDENT_MODEL_PATH}') / (1024 * 1024),
-    'fps': 0  # Can't measure FPS directly
+    'model_size_mb': os.path.getsize('${STUDENT_MODEL_PATH}') / (1024 * 1024)
 }
 
-with open('/tmp/model_metrics.json', 'w') as f:
-    json.dump(metrics, f)
-"
-                            # Read the metrics
-                            METRICS=$(cat /tmp/model_metrics.json)
-                            MAP50=$(echo $METRICS | python -c "import json, sys; print(json.load(sys.stdin)['map50'])")
-                            MAP50_95=$(echo $METRICS | python -c "import json, sys; print(json.load(sys.stdin)['map50_95'])")
-                            MODEL_SIZE=$(echo $METRICS | python -c "import json, sys; print(json.load(sys.stdin)['model_size_mb'])")
-                            FPS=0
-                        else
-                            # Find evaluation results file
-                            EVAL_FILE=$(find "${EVAL_OUTPUT_DIR}" -name "*_eval_results.json" | head -1)
+with open('${KD_RESULT_DIR}/metrics_a${ALPHA}_t${TEMP}.json', 'w') as f:
+    json.dump(metrics, f, indent=2)
 
-                            if [ -f "$EVAL_FILE" ]; then
-                                # Read the metrics
-                                MAP50=$(python -c "import json; print(json.load(open('$EVAL_FILE'))['map50'])")
-                                MAP50_95=$(python -c "import json; print(json.load(open('$EVAL_FILE'))['map50_95'])")
-                                FPS=$(python -c "import json; print(json.load(open('$EVAL_FILE')).get('fps', 0))")
-                                MODEL_SIZE=$(python -c "import json; print(json.load(open('$EVAL_FILE')).get('model_size_mb', 0))")
-                            else
-                                echo "Warning: Evaluation file not found for $STUDENT_NAME_SAFE"
-                                MAP50=0
-                                MAP50_95=0
-                                FPS=0
-                                MODEL_SIZE=0
-                            fi
+print(f'{ALPHA},{TEMP},{metrics[\"map50\"]},{metrics[\"map50_95\"]},{metrics[\"model_size_mb\"]},{MODEL_COPY}')
+" >> $RESULTS_FILE
+
+                            echo "Completed training and evaluation for alpha=${ALPHA}, temperature=${TEMP}"
+                        done
+                    done
+
+                    # Log end time
+                    echo "KD End Time: $(date)" >> ${ARTIFACT_DIR}/kd_timing.txt
+
+                    # Analyze results to find best model
+                    echo "Analyzing results to find best model..."
+                    python ${KD_REPO}/analyze_results.py --results "${RESULTS_FILE}" --output "${KD_RESULT_DIR}/analysis"
+
+                    # Copy best model
+                    if [ -f "${KD_RESULT_DIR}/analysis/best_model.txt" ]; then
+                        BEST_MODEL_PATH=$(grep "Path:" ${KD_RESULT_DIR}/analysis/best_model.txt | cut -d' ' -f2)
+                        if [ -f "$BEST_MODEL_PATH" ]; then
+                            echo "Copying best model to ${KD_RESULT_DIR}/${params.MODEL_NAME}.pt"
+                            cp "$BEST_MODEL_PATH" "${KD_RESULT_DIR}/${params.MODEL_NAME}.pt"
                         fi
                     fi
 
-                    # Add to results file
-                    echo "${ALPHA},${TEMP},${MAP50},${MAP50_95},${FPS},${MODEL_SIZE},${MODEL_COPY}" >> $RESULTS_FILE
-
-                    # Check if this is the best model so far using bc for float comparison
-                    if (( $(echo "$MAP50 > $BEST_MAP" | bc -l) )); then
-                        BEST_MAP=$MAP50
-                        BEST_MODEL_PATH=$MODEL_COPY
-                        BEST_ALPHA=$ALPHA
-                        BEST_TEMP=$TEMP
-                        echo "New best model found! alpha=${ALPHA}, temperature=${TEMP}, mAP50=${MAP50}"
-                    fi
-
-                    echo "Completed training and evaluation for alpha=${ALPHA}, temperature=${TEMP}"
-                done
-            done
-
-            # Log end time
-            echo "KD End Time: $(date)" >> ${ARTIFACT_DIR}/kd_timing.txt
-
-            # Create the best model link
-            mkdir -p ${WORKSPACE}/kd_results/student_model
-            if [ -n "$BEST_MODEL_PATH" ] && [ -f "$BEST_MODEL_PATH" ]; then
-                echo "Best model found: $BEST_MODEL_PATH (alpha=$BEST_ALPHA, temperature=$BEST_TEMP, mAP50=$BEST_MAP)"
-                cp "$BEST_MODEL_PATH" "${WORKSPACE}/kd_results/student_model/student_best.pt"
-                echo "Best model copied to: ${WORKSPACE}/kd_results/student_model/student_best.pt"
-            else
-                echo "Warning: No best model found. Using the last trained model."
-                # Find the last model
-                LAST_MODEL=$(find ${WORKSPACE}/kd_results/models -name "*.pt" | sort | tail -1)
-                if [ -n "$LAST_MODEL" ] && [ -f "$LAST_MODEL" ]; then
-                    cp "$LAST_MODEL" "${WORKSPACE}/kd_results/student_model/student_best.pt"
-                else
-                    echo "Warning: No trained models found. Creating an empty placeholder."
-                    touch "${WORKSPACE}/kd_results/student_model/student_best.pt"
-                fi
-            fi
-
-            # Generate a heatmap visualization of parameter combinations
-            if [ -f "$RESULTS_FILE" ] && [ -s "$RESULTS_FILE" ]; then
-                python -c "
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-# Read the results
-try:
-    df = pd.read_csv('${RESULTS_FILE}')
-
-    if len(df) == 0:
-        print('Warning: Results file is empty. Skipping visualizations.')
-        exit(0)
-
-    # Create pivot tables for different metrics
-    for metric in ['map50', 'map50_95', 'fps', 'model_size_mb']:
-        try:
-            # Convert to numeric just in case
-            df[metric] = pd.to_numeric(df[metric], errors='coerce')
-
-            # Create pivot table
-            pivot = df.pivot_table(
-                values=metric,
-                index='temperature',
-                columns='alpha',
-                aggfunc='mean'
-            )
-
-            # Create heatmap
-            plt.figure(figsize=(10, 8))
-            if metric in ['map50', 'map50_95', 'fps']:
-                # Higher is better for these metrics
-                cmap = 'viridis'
-            else:
-                # Lower is better for model size
-                cmap = 'viridis_r'
-
-            sns.heatmap(pivot, annot=True, cmap=cmap, fmt='.4f')
-            plt.title(f'Impact of alpha and temperature on {metric}')
-            plt.tight_layout()
-            plt.savefig('${WORKSPACE}/kd_results/{metric}_heatmap.png')
-            print(f'Created heatmap for {metric}')
-        except Exception as e:
-            print(f'Error creating heatmap for {metric}: {e}')
-
-    # Also create a combined score heatmap
-    try:
-        # Normalize each metric to 0-1 range
-        for metric in ['map50', 'map50_95', 'fps', 'model_size_mb']:
-            df[metric] = pd.to_numeric(df[metric], errors='coerce')
-            min_val = df[metric].min()
-            max_val = df[metric].max()
-            if max_val > min_val:
-                df[f'{metric}_norm'] = (df[metric] - min_val) / (max_val - min_val)
-            else:
-                df[f'{metric}_norm'] = 0
-
-        # Invert model_size_mb so smaller is better
-        if 'model_size_mb_norm' in df.columns:
-            df['model_size_mb_norm'] = 1 - df['model_size_mb_norm']
-
-        # Create combined score (with weightings)
-        df['combined_score'] = (
-            df['map50_norm'] * 0.4 +
-            df['map50_95_norm'] * 0.4 +
-            df['fps_norm'] * 0.1 +
-            df['model_size_mb_norm'] * 0.1
-        )
-
-        # Create pivot table for combined score
-        pivot = df.pivot_table(
-            values='combined_score',
-            index='temperature',
-            columns='alpha',
-            aggfunc='mean'
-        )
-
-        # Create heatmap
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(pivot, annot=True, cmap='viridis', fmt='.4f')
-        plt.title('Impact of alpha and temperature on combined score')
-        plt.tight_layout()
-        plt.savefig('${WORKSPACE}/kd_results/combined_score_heatmap.png')
-        print('Created heatmap for combined score')
-    except Exception as e:
-        print(f'Error creating combined score heatmap: {e}')
-
-    # Create a detailed parameter report
-    with open('${WORKSPACE}/kd_results/parameter_report.md', 'w') as f:
-        f.write('# Knowledge Distillation Parameter Study\\n\\n')
-        f.write(f'Date: {pd.Timestamp.now().strftime(\"%Y-%m-%d %H:%M:%S\")}\\n\\n')
-
-        f.write('## Parameter Combinations Tested\\n\\n')
-        f.write('| Alpha | Temperature | mAP@50 | mAP@50-95 | FPS | Model Size (MB) |\\n')
-        f.write('| ----- | ----------- | ------ | --------- | --- | --------------- |\\n')
-
-        for _, row in df.sort_values('map50', ascending=False).iterrows():
-            f.write(f'| {row[\"alpha\"]} | {row[\"temperature\"]} | {row[\"map50\"]:.4f} | {row[\"map50_95\"]:.4f} | {row[\"fps\"]:.2f} | {row[\"model_size_mb\"]:.2f} |\\n')
-
-        f.write('\\n## Best Parameters\\n\\n')
-
-        best_row = df.loc[df['map50'].idxmax()]
-        f.write(f'* Best for mAP@50: alpha={best_row[\"alpha\"]}, temperature={best_row[\"temperature\"]} (mAP@50={best_row[\"map50\"]:.4f})\\n')
-
-        best_row = df.loc[df['map50_95'].idxmax()]
-        f.write(f'* Best for mAP@50-95: alpha={best_row[\"alpha\"]}, temperature={best_row[\"temperature\"]} (mAP@50-95={best_row[\"map50_95\"]:.4f})\\n')
-
-        if 'fps' in df.columns and df['fps'].max() > 0:
-            best_row = df.loc[df['fps'].idxmax()]
-            f.write(f'* Best for speed: alpha={best_row[\"alpha\"]}, temperature={best_row[\"temperature\"]} (FPS={best_row[\"fps\"]:.2f})\\n')
-
-        best_row = df.loc[df['model_size_mb'].idxmin()]
-        f.write(f'* Best for size: alpha={best_row[\"alpha\"]}, temperature={best_row[\"temperature\"]} (Size={best_row[\"model_size_mb\"]:.2f} MB)\\n')
-
-        if 'combined_score' in df.columns:
-        best_row = df.loc[df['combined_score'].idxmax()]
-        f.write(f'* Best overall: alpha={best_row[\"alpha\"]}, temperature={best_row[\"temperature\"]} (Combined score={best_row[\"combined_score\"]:.4f})\\n')
-
-    f.write('\\n## Recommendations\\n\\n')
-    f.write('Based on the parameter study, we recommend the following settings for knowledge distillation:\\n\\n')
-
-    if 'combined_score' in df.columns:
-        best_row = df.loc[df['combined_score'].idxmax()]
-        f.write(f'* alpha = {best_row[\"alpha\"]}\\n')
-        f.write(f'* temperature = {best_row[\"temperature\"]}\\n\\n')
-    else:
-        best_row = df.loc[df['map50'].idxmax()]
-        f.write(f'* alpha = {best_row[\"alpha\"]}\\n')
-        f.write(f'* temperature = {best_row[\"temperature\"]}\\n\\n')
-
-    f.write('These parameters provide the best balance between accuracy, speed, and model size.\\n')
-print('Created parameter report')
-"
-
-                    # Create a copy for artifacts
-                    cp -r ${WORKSPACE}/kd_results ${ARTIFACT_DIR}/kd_results
-
-                    # Copy to email artifacts
-                    cp ${WORKSPACE}/kd_results/parameter_report.md ${WORKSPACE}/email_artifacts/ || true
-                    cp ${WORKSPACE}/kd_results/*_heatmap.png ${WORKSPACE}/email_artifacts/ || true
+                    # Create a visualization of alpha and temperature impact
+                    echo "Creating visualizations of parameter impact..."
+                    cp ${KD_RESULT_DIR}/analysis/*.png ${WORKSPACE}/email_artifacts/
+                    cp ${KD_RESULT_DIR}/analysis/parameter_study_report.md ${WORKSPACE}/email_artifacts/
 
                     echo "Knowledge distillation parameter study completed successfully."
                 '''
 
+                // Archive results and artifacts
                 archiveArtifacts artifacts: 'kd_results/**', fingerprint: true, allowEmptyArchive: true
-                archiveArtifacts artifacts: 'artifacts/kd_results/**', fingerprint: true, allowEmptyArchive: true
                 archiveArtifacts artifacts: 'artifacts/kd_timing.txt', fingerprint: true, allowEmptyArchive: true
-                archiveArtifacts artifacts: 'email_artifacts/*.md', fingerprint: true, allowEmptyArchive: true
                 archiveArtifacts artifacts: 'email_artifacts/*.png', fingerprint: true, allowEmptyArchive: true
+                archiveArtifacts artifacts: 'email_artifacts/*.md', fingerprint: true, allowEmptyArchive: true
             }
         }
 
-        stage('Upload Student Model to S3') {
+        stage('Model Export and Optimization') {
             steps {
-                withCredentials([
-                    string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-                ]) {
-                    sh '''#!/bin/bash -e
-                        # Activate virtual environment
-                        source ${VENV_NAME}/bin/activate
+                sh '''#!/bin/bash -e
+                    # Activate virtual environment
+                    source ${VENV_NAME}/bin/activate
 
-                        # Find the student model path
-                        STUDENT_MODEL_PATH=${WORKSPACE}/kd_results/student_model/student_best.pt
+                    # Find the best model
+                    BEST_MODEL_PATH="${KD_RESULT_DIR}/${params.MODEL_NAME}.pt"
 
-                        if [ ! -f "$STUDENT_MODEL_PATH" ]; then
-                            echo "Student model not found at $STUDENT_MODEL_PATH"
-                            echo "Looking in runs directory..."
-                            STUDENT_MODEL_PATH=$(find ${WORKSPACE}/runs/detect -name "best.pt" | grep "yolov8_nas_kd" | head -1)
+                    if [ ! -f "$BEST_MODEL_PATH" ]; then
+                        echo "Best model not found at $BEST_MODEL_PATH, looking for alternatives..."
+                        BEST_MODEL_PATH=$(find ${KD_RESULT_DIR}/models -name "*.pt" | head -1)
 
-                            if [ -z "$STUDENT_MODEL_PATH" ] || [ ! -f "$STUDENT_MODEL_PATH" ]; then
-                                echo "No student model found for upload. Skipping S3 upload."
-                                exit 0
-                            fi
-                        fi
-
-                        echo "Found student model at: $STUDENT_MODEL_PATH"
-
-                        # Create a version number based on date and build number
-                        VERSION="v$(date +%Y%m%d)_b${BUILD_NUMBER}"
-                        STUDENT_MODEL_NAME="${params.MODEL_NAME}_student_${VERSION}"
-
-                        # Install required packages
-                        pip install boto3
-
-                        # Find upload_s3.py script
-                        UPLOAD_SCRIPT_PATH=$(find ${WORKSPACE}/${MODEL_OPT_REPO} -name "upload_s3.py" -type f | head -n 1)
-
-                        if [ -z "${UPLOAD_SCRIPT_PATH}" ]; then
-                            echo "upload_s3.py not found in the model optimization repository!"
+                        if [ ! -f "$BEST_MODEL_PATH" ]; then
+                            echo "No model found. Cannot continue with export."
                             exit 1
                         fi
+                    fi
 
-                        UPLOAD_DIR=$(dirname "${UPLOAD_SCRIPT_PATH}")
+                    echo "Exporting best model: $BEST_MODEL_PATH"
 
-                        # Create a directory with student model and metadata
-                        mkdir -p /tmp/student_model_${BUILD_NUMBER}
-                        cp "${STUDENT_MODEL_PATH}" "/tmp/student_model_${BUILD_NUMBER}/student_best.pt"
+                    # Create export directory
+                    mkdir -p ${KD_RESULT_DIR}/exports
 
-                        # Copy comparison report if it exists
-                        if [ -f "${WORKSPACE}/kd_results/parameter_report.md" ]; then
-                            cp "${WORKSPACE}/kd_results/parameter_report.md" "/tmp/student_model_${BUILD_NUMBER}/"
-                        fi
+                    # Export to different formats (ONNX, TensorRT, etc.)
+                    echo "Exporting to ONNX..."
+                    python -c "
+from ultralytics import YOLO
 
-                        # Create notes file
-                        echo "Knowledge distilled student model from Jenkins build #${BUILD_NUMBER}" > /tmp/student_model_${BUILD_NUMBER}/notes.txt
+model = YOLO('${BEST_MODEL_PATH}')
 
-                        # Upload student model to S3
-                        cd "${UPLOAD_DIR}"
+# Export to ONNX
+model.export(format='onnx', imgsz=640)
+"
 
-                        # Run upload
-                        python upload_s3.py "/tmp/student_model_${BUILD_NUMBER}" "${STUDENT_MODEL_NAME}" --project "yolov8_student_model" --notes "Knowledge distilled student model from Jenkins build #${BUILD_NUMBER}"
+                    # Find and move exported models
+                    find $(dirname ${BEST_MODEL_PATH}) -name "*.onnx" -exec cp {} ${KD_RESULT_DIR}/exports/ \;
 
-                        echo "Student model uploaded to S3 successfully."
+                    echo "Model export completed."
 
-                        # Save upload info
-                        mkdir -p ${ARTIFACT_DIR}/kd_results
-                        echo "Student model uploaded to S3 as: ${STUDENT_MODEL_NAME}" >> ${ARTIFACT_DIR}/kd_results/upload_info.txt
-                        echo "Upload time: $(date)" >> ${ARTIFACT_DIR}/kd_results/upload_info.txt
+                    # Create a simple benchmark script
+                    cat > ${KD_REPO}/benchmark.py << 'EOL'
+from ultralytics import YOLO
+import time
+import argparse
+import numpy as np
+import json
+import os
 
-                        # Clean up
-                        rm -rf /tmp/student_model_${BUILD_NUMBER}
-                    '''
+def benchmark_model(model_path, img_size=640, num_runs=100):
+    """Benchmark model inference time"""
+    print(f"Benchmarking {model_path}...")
 
-                    archiveArtifacts artifacts: 'artifacts/kd_results/upload_info.txt', fingerprint: true, allowEmptyArchive: true
-                }
+    # Load model
+    model = YOLO(model_path)
+
+    # Create dummy input (black image)
+    dummy_img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+
+    # Warmup
+    print("Warming up...")
+    for _ in range(10):
+        model(dummy_img)
+
+    # Benchmark
+    print(f"Running benchmark with {num_runs} iterations...")
+    inference_times = []
+    for _ in range(num_runs):
+        start_time = time.time()
+        model(dummy_img)
+        end_time = time.time()
+        inference_times.append(end_time - start_time)
+
+    # Calculate statistics
+    mean_time = np.mean(inference_times)
+    median_time = np.median(inference_times)
+    std_time = np.std(inference_times)
+    fps = 1.0 / mean_time
+
+    # Get model size
+    model_size_mb = os.path.getsize(model_path) / (1024 * 1024)
+
+    # Create benchmark results
+    results = {
+        "model_path": model_path,
+        "img_size": img_size,
+        "num_runs": num_runs,
+        "mean_inference_time": mean_time,
+        "median_inference_time": median_time,
+        "std_inference_time": std_time,
+        "fps": fps,
+        "model_size_mb": model_size_mb
+    }
+
+    print(f"Benchmark results:")
+    print(f"  Mean inference time: {mean_time:.4f} seconds")
+    print(f"  Median inference time: {median_time:.4f} seconds")
+    print(f"  FPS: {fps:.2f}")
+    print(f"  Model size: {model_size_mb:.2f} MB")
+
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark YOLOv8 model inference")
+    parser.add_argument("--model", type=str, required=True, help="Path to model file")
+    parser.add_argument("--img-size", type=int, default=640, help="Image size")
+    parser.add_argument("--num-runs", type=int, default=100, help="Number of benchmark runs")
+    parser.add_argument("--output", type=str, help="Path to save benchmark results as JSON")
+
+    args = parser.parse_args()
+    results = benchmark_model(args.model, args.img_size, args.num_runs)
+
+    if args.output:
+        with open(args.output, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Benchmark results saved to {args.output}")
+
+if __name__ == "__main__":
+    main()
+EOL
+
+                    # Run benchmark on the exported model
+                    echo "Running benchmark on the exported model..."
+                    python ${KD_REPO}/benchmark.py --model ${BEST_MODEL_PATH} --num-runs 50 --output ${KD_RESULT_DIR}/benchmark_results.json
+
+                    # Copy benchmark results to email artifacts
+                    cp ${KD_RESULT_DIR}/benchmark_results.json ${WORKSPACE}/email_artifacts/
+                '''
+
+                // Archive model exports
+                archiveArtifacts artifacts: 'kd_results/exports/**', fingerprint: true, allowEmptyArchive: true
+                archiveArtifacts artifacts: 'kd_results/benchmark_results.json', fingerprint: true, allowEmptyArchive: true
+                archiveArtifacts artifacts: 'email_artifacts/benchmark_results.json', fingerprint: true, allowEmptyArchive: true
             }
         }
 
-       stage('Generate Reports') {
-		steps {
-			// First pass the Jenkins variables to environment variables
-			sh """
-				echo "${params.MODEL_NAME}" > model_name.txt
-				echo "${params.NAS_TRIALS}" > nas_trials.txt
-				echo "${params.NAS_EPOCHS}" > nas_epochs.txt
-				echo "${params.GDRIVE_FILE_ID}" > gdrive_id.txt
-				echo "${env.BUILD_NUMBER}" > build_number.txt
-				echo "${env.JOB_NAME}" > job_name.txt
-				echo "${env.JENKINS_URL}" > jenkins_url.txt
-			"""
+        stage('Generate Final Report') {
+            steps {
+                sh '''#!/bin/bash -e
+                    # Activate virtual environment
+                    source ${VENV_NAME}/bin/activate
 
-			// Then run the script with simpler variable substitution
-			sh '''#!/bin/bash -e
-				# Activate virtual environment
-				source ${VENV_NAME}/bin/activate
+                    # Create a directory for the final report
+                    mkdir -p ${ARTIFACT_DIR}/final_report
 
-				# Install any required packages for report generation
-				pip install jinja2 matplotlib
+                    # Create a simple HTML report
+                    cat > ${ARTIFACT_DIR}/final_report/kd_report.html << 'ENDOFHTML'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>YOLOv8 Knowledge Distillation Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; margin: 20px; }
+        h1, h2, h3 { color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .section { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 4px; }
+        pre { background: #f8f8f8; padding: 10px; overflow-x: auto; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>YOLOv8 Knowledge Distillation Report</h1>
+        <p><strong>Build #BUILD_NUMBER</strong> - Generated on GENERATION_DATE</p>
 
-				# Read variables from files
-				BUILD_NUM=$(cat build_number.txt)
-				MODEL_NAME=$(cat model_name.txt)
-				NAS_TRIALS=$(cat nas_trials.txt)
-				NAS_EPOCHS=$(cat nas_epochs.txt)
-				GDRIVE_ID=$(cat gdrive_id.txt)
-				JOB_NAME=$(cat job_name.txt)
-				JENKINS_URL=$(cat jenkins_url.txt)
+        <div class="section">
+            <h2>Model Information</h2>
+            <table>
+                <tr><th>Parameter</th><th>Value</th></tr>
+                <tr><td>Model Name</td><td>MODEL_NAME</td></tr>
+                <tr><td>Teacher Model</td><td>TEACHER_MODEL</td></tr>
+                <tr><td>Student Model</td><td>STUDENT_MODEL</td></tr>
+                <tr><td>KD Epochs</td><td>KD_EPOCHS</td></tr>
+            </table>
+        </div>
 
-				# Read model metadata if it exists
-				MODEL_METADATA=""
-				if [ -f "${ARTIFACT_DIR}/model_metadata.txt" ]; then
-					MODEL_METADATA=$(cat ${ARTIFACT_DIR}/model_metadata.txt)
-				fi
+        <div class="section">
+            <h2>Knowledge Distillation Parameter Study</h2>
+            <p>Multiple combinations of alpha and temperature values were tested to find the optimal settings.</p>
 
-				# Create a directory for the final report
-				mkdir -p ${ARTIFACT_DIR}/final_report
+            <h3>Best Model Parameters</h3>
+            <pre>BEST_MODEL_INFO</pre>
 
-				# Create an HTML report with embedded images and data
-				cat > ${ARTIFACT_DIR}/final_report/build_report.html << 'ENDOFHTML'
-	<!DOCTYPE html>
-	<html>
-	<head>
-		<title>YOLOv8 Model Optimization Report</title>
-		<style>
-			body { font-family: Arial, sans-serif; line-height: 1.6; margin: 20px; }
-			h1, h2, h3 { color: #333; }
-			.container { max-width: 1200px; margin: 0 auto; }
-			.section { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 4px; }
-			.metrics { display: flex; flex-wrap: wrap; gap: 10px; }
-			.metric { background: #f5f5f5; padding: 10px; border-radius: 4px; min-width: 200px; }
-			pre { background: #f8f8f8; padding: 10px; overflow-x: auto; }
-			table { border-collapse: collapse; width: 100%; }
-			th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-			th { background-color: #f2f2f2; }
-			.image-container { text-align: center; margin: 15px 0; }
-			.image-container img { max-width: 100%; }
-		</style>
-	</head>
-	<body>
-		<div class="container">
-			<h1>YOLOv8 Model Optimization Report</h1>
-			<p><strong>Build #BUILD_NUMBER_PLACEHOLDER</strong> - Generated on GENERATION_DATE</p>
+            <h3>Benchmark Results</h3>
+            <pre>BENCHMARK_RESULTS</pre>
+        </div>
 
-			<div class="section">
-				<h2>Model Information</h2>
-				<pre>MODEL_METADATA_PLACEHOLDER</pre>
-			</div>
+        <div class="section">
+            <h2>Build Timing Information</h2>
+            <pre>KD_TIMING</pre>
+        </div>
 
-			<div class="section">
-				<h2>Build Parameters</h2>
-				<table>
-					<tr><th>Parameter</th><th>Value</th></tr>
-					<tr><td>Model Name</td><td>MODEL_NAME_PLACEHOLDER</td></tr>
-					<tr><td>NAS Trials</td><td>NAS_TRIALS_PLACEHOLDER</td></tr>
-					<tr><td>NAS Epochs</td><td>NAS_EPOCHS_PLACEHOLDER</td></tr>
-					<tr><td>Dataset ID</td><td>DATASET_ID_PLACEHOLDER</td></tr>
-				</table>
-			</div>
-
-			<div class="section">
-				<h2>Neural Architecture Search Results</h2>
-				<p>Results from the NAS process that evaluated NAS_TRIALS_PLACEHOLDER different model architectures.</p>
-
-				<h3>Best Models</h3>
-				<pre>BEST_MODELS_PLACEHOLDER</pre>
-
-				<h3>Visualizations</h3>
-				<div class="image-container">
-					<p><em>If visualizations are available, they can be found in the build artifacts.</em></p>
-				</div>
-			</div>
-
-			<div class="section">
-				<h2>Performance Metrics</h2>
-				<p>Performance evaluation of the optimized models.</p>
-
-				<pre>BENCHMARK_DATA_PLACEHOLDER</pre>
-			</div>
-
-			<div class="section">
-				<h2>Knowledge Distillation</h2>
-				<p>Knowledge distillation was performed using the best model architecture from Neural Architecture Search and YOLOv8x as the teacher model.</p>
-
-				<h3>Parameter Study Results</h3>
-				<p>Multiple combinations of alpha and temperature values were tested to find the optimal settings.</p>
-
-				<pre>KD_PARAMETER_REPORT_PLACEHOLDER</pre>
-
-				<h3>Best Student Model</h3>
-				<p>The best performing student model has been uploaded to S3.</p>
-				<pre>KD_UPLOAD_INFO_PLACEHOLDER</pre>
-			</div>
-
-			<div class="section">
-				<h2>Build Timing Information</h2>
-				<pre>NAS_TIMING_PLACEHOLDER
-EVALUATION_TIMING_PLACEHOLDER
-KD_TIMING_PLACEHOLDER</pre>
-			</div>
-
-			<div class="section">
-				<h2>Additional Information</h2>
-				<p>See the full build log and artifacts for detailed information about the model optimization process.</p>
-				<p><a href="BUILD_URL_PLACEHOLDER">View Build Details</a></p>
-			</div>
-		</div>
-	</body>
-	</html>
+        <div class="section">
+            <h2>Next Steps</h2>
+            <p>The optimized model has been saved and can be used for inference in your applications.</p>
+            <p>The model is available in the following formats:</p>
+            <ul>
+                <li>PyTorch (.pt)</li>
+                <li>ONNX (.onnx)</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
 ENDOFHTML
 
-				# Now replace the placeholders with actual content
-				BEST_MODELS=$(cat ${ARTIFACT_DIR}/best_models.txt 2>/dev/null || echo "No best models information available")
-				BENCHMARK_DATA=$(find ${WORKSPACE} -name "*benchmark*.csv" -type f | sort | head -n 1 | xargs cat 2>/dev/null || echo "No benchmark data available")
-				NAS_TIMING=$(cat ${ARTIFACT_DIR}/nas_timing.txt 2>/dev/null || echo "No timing data available")
-				EVAL_TIMING=$(cat ${ARTIFACT_DIR}/evaluation_timing.txt 2>/dev/null || echo "No timing data available")
-				KD_TIMING=$(cat ${ARTIFACT_DIR}/kd_timing.txt 2>/dev/null || echo "No knowledge distillation timing data available")
-				KD_PARAMETER_REPORT=$(cat ${WORKSPACE}/kd_results/parameter_report.md 2>/dev/null || echo "No knowledge distillation parameter report available")
-				KD_UPLOAD_INFO=$(cat ${ARTIFACT_DIR}/kd_results/upload_info.txt 2>/dev/null || echo "No knowledge distillation upload information available")
-				CURRENT_DATE=$(date)
-				BUILD_URL="${JENKINS_URL}job/${JOB_NAME}/${BUILD_NUM}/"
+                    # Replace placeholders with actual content
+                    sed -i "s|BUILD_NUMBER|${BUILD_NUMBER}|g" ${ARTIFACT_DIR}/final_report/kd_report.html
+                    sed -i "s|GENERATION_DATE|$(date)|g" ${ARTIFACT_DIR}/final_report/kd_report.html
+                    sed -i "s|MODEL_NAME|${params.MODEL_NAME}|g" ${ARTIFACT_DIR}/final_report/kd_report.html
+                    sed -i "s|TEACHER_MODEL|${params.TEACHER_MODEL}|g" ${ARTIFACT_DIR}/final_report/kd_report.html
+                    sed -i "s|STUDENT_MODEL|${params.STUDENT_MODEL}|g" ${ARTIFACT_DIR}/final_report/kd_report.html
+                    sed -i "s|KD_EPOCHS|${params.KD_EPOCHS}|g" ${ARTIFACT_DIR}/final_report/kd_report.html
 
-				# Perform the replacements
-				sed -i "s|BUILD_NUMBER_PLACEHOLDER|${BUILD_NUM}|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				sed -i "s|GENERATION_DATE|${CURRENT_DATE}|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				sed -i "s|MODEL_NAME_PLACEHOLDER|${MODEL_NAME}|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				sed -i "s|NAS_TRIALS_PLACEHOLDER|${NAS_TRIALS}|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				sed -i "s|NAS_EPOCHS_PLACEHOLDER|${NAS_EPOCHS}|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				sed -i "s|DATASET_ID_PLACEHOLDER|${GDRIVE_ID}|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				sed -i "s|BUILD_URL_PLACEHOLDER|${BUILD_URL}|g" ${ARTIFACT_DIR}/final_report/build_report.html
+                    # Get best model info
+                    BEST_MODEL_INFO=$(cat ${KD_RESULT_DIR}/analysis/best_model.txt 2>/dev/null || echo "No best model information available")
+                    # Get benchmark results
+                    BENCHMARK_RESULTS=$(cat ${KD_RESULT_DIR}/benchmark_results.json 2>/dev/null || echo "No benchmark results available")
+                    # Get KD timing
+                    KD_TIMING=$(cat ${ARTIFACT_DIR}/kd_timing.txt 2>/dev/null || echo "No knowledge distillation timing data available")
 
-				# For multiline content, use a different approach
-				# Create temporary files with the content
-				echo "${MODEL_METADATA}" > /tmp/model_metadata.txt
-				echo "${BEST_MODELS}" > /tmp/best_models.txt
-				echo "${BENCHMARK_DATA}" > /tmp/benchmark_data.txt
-				echo "NAS Timing: ${NAS_TIMING}" > /tmp/nas_timing.txt
-				echo "Evaluation Timing: ${EVAL_TIMING}" > /tmp/eval_timing.txt
-				echo "Knowledge Distillation Timing: ${KD_TIMING}" > /tmp/kd_timing.txt
-				echo "${KD_PARAMETER_REPORT}" > /tmp/kd_parameter_report.txt
-				echo "${KD_UPLOAD_INFO}" > /tmp/kd_upload_info.txt
+                    # Create temporary files with the content
+                    echo "${BEST_MODEL_INFO}" > /tmp/best_model_info.txt
+                    echo "${BENCHMARK_RESULTS}" > /tmp/benchmark_results.txt
+                    echo "${KD_TIMING}" > /tmp/kd_timing.txt
 
-				# Use perl to do multiline replacements
-				perl -i -0pe "s|MODEL_METADATA_PLACEHOLDER|$(cat /tmp/model_metadata.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				perl -i -0pe "s|BEST_MODELS_PLACEHOLDER|$(cat /tmp/best_models.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				perl -i -0pe "s|BENCHMARK_DATA_PLACEHOLDER|$(cat /tmp/benchmark_data.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				perl -i -0pe "s|NAS_TIMING_PLACEHOLDER|$(cat /tmp/nas_timing.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				perl -i -0pe "s|EVALUATION_TIMING_PLACEHOLDER|$(cat /tmp/eval_timing.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				perl -i -0pe "s|KD_TIMING_PLACEHOLDER|$(cat /tmp/kd_timing.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				perl -i -0pe "s|KD_PARAMETER_REPORT_PLACEHOLDER|$(cat /tmp/kd_parameter_report.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/build_report.html
-				perl -i -0pe "s|KD_UPLOAD_INFO_PLACEHOLDER|$(cat /tmp/kd_upload_info.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/build_report.html
+                    # Use perl to do multiline replacements
+                    perl -i -0pe "s|BEST_MODEL_INFO|$(cat /tmp/best_model_info.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/kd_report.html
+                    perl -i -0pe "s|BENCHMARK_RESULTS|$(cat /tmp/benchmark_results.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/kd_report.html
+                    perl -i -0pe "s|KD_TIMING|$(cat /tmp/kd_timing.txt | sed 's/[\\&/]/\\\\&/g')|g" ${ARTIFACT_DIR}/final_report/kd_report.html
 
-				# Create email artifacts directory if it doesn't exist
-				mkdir -p ${WORKSPACE}/email_artifacts
+                    # Copy the report to email artifacts
+                    cp ${ARTIFACT_DIR}/final_report/kd_report.html ${WORKSPACE}/email_artifacts/
 
-				# Copy the report to email artifacts
-				cp ${ARTIFACT_DIR}/final_report/build_report.html ${WORKSPACE}/email_artifacts/
+                    echo "Build report generated successfully."
 
-				echo "Build report generated successfully."
+                    # Clean up temporary files
+                    rm -f /tmp/best_model_info.txt /tmp/benchmark_results.txt /tmp/kd_timing.txt
+                '''
 
-				# Clean up temporary files
-				rm -f /tmp/model_metadata.txt /tmp/best_models.txt /tmp/benchmark_data.txt /tmp/nas_timing.txt /tmp/eval_timing.txt /tmp/kd_timing.txt /tmp/kd_parameter_report.txt /tmp/kd_upload_info.txt
-			'''
-
-			// Archive the final report
-			archiveArtifacts artifacts: 'artifacts/final_report/**', fingerprint: true, allowEmptyArchive: true
-			archiveArtifacts artifacts: 'email_artifacts/build_report.html', fingerprint: true, allowEmptyArchive: true
-		}
-	}
+                // Archive the final report
+                archiveArtifacts artifacts: 'artifacts/final_report/**', fingerprint: true, allowEmptyArchive: true
+                archiveArtifacts artifacts: 'email_artifacts/kd_report.html', fingerprint: true, allowEmptyArchive: true
+            }
+        }
     }
 
     post {
         success {
-            echo "Pipeline completed successfully. YOLOv8 model optimization completed."
+            echo "Pipeline completed successfully. YOLOv8 knowledge distillation completed."
             emailext (
-                subject: "SUCCESS: YOLOv8 Model Optimization Pipeline '${currentBuild.fullDisplayName}'",
+                subject: "SUCCESS: YOLOv8 Knowledge Distillation Pipeline '${currentBuild.fullDisplayName}'",
                 body: """
                     <html>
                     <body>
-                        <h2>YOLOv8 Model Optimization Pipeline Completed Successfully!</h2>
+                        <h2>YOLOv8 Knowledge Distillation Pipeline Completed Successfully!</h2>
 
                         <p><strong>Job:</strong> ${env.JOB_NAME}<br>
                         <strong>Build Number:</strong> ${env.BUILD_NUMBER}<br>
-                        <strong>Build URL:</strong> <a href="${JENKINS_URL}job/${JOB_NAME}/${BUILD_NUMBER}/">${JENKINS_URL}job/${JOB_NAME}/${BUILD_NUMBER}/</a></p>
+                        <strong>Build URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
 
                         <h3>Model Information:</h3>
                         <ul>
                             <li><strong>Model Name:</strong> ${params.MODEL_NAME}</li>
-                            <li><strong>NAS Trials:</strong> ${params.NAS_TRIALS}</li>
-                            <li><strong>NAS Epochs:</strong> ${params.NAS_EPOCHS}</li>
+                            <li><strong>Teacher Model:</strong> ${params.TEACHER_MODEL}</li>
+                            <li><strong>Student Model:</strong> ${params.STUDENT_MODEL}</li>
+                            <li><strong>KD Epochs:</strong> ${params.KD_EPOCHS}</li>
                         </ul>
 
                         <p>The pipeline executed the following steps:</p>
                         <ol>
-                            <li>Downloaded and augmented the dataset</li>
-                            <li>Performed Neural Architecture Search (NAS) to find optimal model architectures</li>
-                            <li>Evaluated the best models from NAS</li>
-                            <li>Performed Knowledge Distillation to create efficient student models</li>
-                            <li>Uploaded the best knowledge-distilled student model to S3</li>
+                            <li>Downloaded and prepared the dataset</li>
+                            <li>Performed dataset augmentation</li>
+                            <li>Conducted knowledge distillation parameter study</li>
+                            <li>Created optimized model</li>
                         </ol>
 
-                        <p>See the attached validation reports and build report for more details on the model's performance.</p>
-
-                        <p>You can access all build artifacts by clicking the Build URL above and navigating to the 'Artifacts' section.</p>
+                        <p>See the attached reports for more details on the model's performance.</p>
                     </body>
                     </html>
                 """,
                 mimeType: 'text/html',
                 attachLog: true,
-                attachmentsPattern: 'email_artifacts/*.zip,email_artifacts/*.html,email_artifacts/*.md,email_artifacts/*.png',
-                to: "raksbangs@gmail.com"
+                attachmentsPattern: 'email_artifacts/*.html,email_artifacts/*.md,email_artifacts/*.png,email_artifacts/*.json',
+                to: "youremail@example.com"
             )
         }
 
         failure {
             echo "Pipeline failed. Check the logs for details."
             emailext (
-                subject: "FAILURE: YOLOv8 Model Optimization Pipeline '${currentBuild.fullDisplayName}'",
+                subject: "FAILURE: YOLOv8 Knowledge Distillation Pipeline '${currentBuild.fullDisplayName}'",
                 body: """
                     <html>
                     <body>
-                        <h2>YOLOv8 Model Optimization Pipeline Failed</h2>
+                        <h2>YOLOv8 Knowledge Distillation Pipeline Failed</h2>
 
                         <p><strong>Job:</strong> ${env.JOB_NAME}<br>
                         <strong>Build Number:</strong> ${env.BUILD_NUMBER}<br>
                         <strong>Build URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-
-                        <h3>Parameters:</h3>
-                        <ul>
-                            <li><strong>Model Name:</strong> ${params.MODEL_NAME}</li>
-                            <li><strong>NAS Trials:</strong> ${params.NAS_TRIALS}</li>
-                            <li><strong>NAS Epochs:</strong> ${params.NAS_EPOCHS}</li>
-                        </ul>
 
                         <p>Please check the attached log for details on the failure.</p>
-
-                        <p>The most common causes of failure are:</p>
-                        <ol>
-                            <li>Network issues when downloading the dataset</li>
-                            <li>Missing dependencies or Python package installation failures</li>
-                            <li>GPU/CUDA issues during model training</li>
-                            <li>Insufficient disk space for model artifacts</li>
-                            <li>Issues with the dataset format or structure</li>
-                        </ol>
                     </body>
                     </html>
                 """,
                 mimeType: 'text/html',
                 attachLog: true,
-                to: "raksbangs@gmail.com"
-            )
-        }
-
-        unstable {
-            emailext (
-                subject: "UNSTABLE: YOLOv8 Model Optimization Pipeline '${currentBuild.fullDisplayName}'",
-                body: """
-                    <html>
-                    <body>
-                        <h2>YOLOv8 Model Optimization Pipeline Completed with Warnings</h2>
-
-                        <p><strong>Job:</strong> ${env.JOB_NAME}<br>
-                        <strong>Build Number:</strong> ${env.BUILD_NUMBER}<br>
-                        <strong>Build URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-
-                        <p>The pipeline completed but some stages may have encountered non-critical issues.</p>
-
-                        <p>Please check the attached log for details on what might need attention.</p>
-                    </body>
-                    </html>
-                """,
-                mimeType: 'text/html',
-                attachLog: true,
-                to: "raksbangs@gmail.com"
+                to: "youremail@example.com"
             )
         }
 
