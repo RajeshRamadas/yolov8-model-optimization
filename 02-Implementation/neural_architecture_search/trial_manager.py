@@ -1,7 +1,7 @@
-# trial_manager.py
+# trial_manager.py - ENHANCED VERSION with device detection fixes
 """
 Module for managing trial execution in Neural Architecture Search.
-FIXED VERSION - Resolves kernel size modification and YAML generation issues.
+ENHANCED VERSION - Resolves CUDA detection and device assignment issues.
 """
 
 import os
@@ -10,6 +10,46 @@ import subprocess
 import yaml
 from pathlib import Path
 from utils import save_json, load_json
+
+
+def detect_device():
+    """
+    Intelligently detect the best available device for training.
+    
+    Returns:
+        str: Device string ('cuda:0', 'mps', or 'cpu')
+    """
+    try:
+        import torch
+        
+        # Check for NVIDIA CUDA
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            if device_count > 0:
+                # Test if we can actually use CUDA
+                try:
+                    test_tensor = torch.randn(2, 2).cuda()
+                    del test_tensor  # Clean up
+                    return f'cuda:0'  # Use first GPU
+                except Exception as e:
+                    print(f"⚠️  CUDA detected but not functional: {e}")
+        
+        # Check for Apple Metal Performance Shaders (M1/M2 Macs)
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            try:
+                test_tensor = torch.randn(2, 2).to('mps')
+                del test_tensor
+                return 'mps'
+            except Exception as e:
+                print(f"⚠️  MPS detected but not functional: {e}")
+        
+        # Fallback to CPU
+        print("ℹ️  Using CPU device (CUDA/MPS not available)")
+        return 'cpu'
+        
+    except ImportError:
+        print("⚠️  PyTorch not available, defaulting to CPU")
+        return 'cpu'
 
 
 def generate_custom_yaml(trial_id, params, results_dir):
@@ -94,7 +134,7 @@ def generate_custom_yaml(trial_id, params, results_dir):
 
 def generate_trial_script(trial_id, params, data_yaml, results_dir, epochs):
     """
-    Generate a Python script for running a single trial.
+    Generate a Python script for running a single trial with enhanced device detection.
     
     Args:
         trial_id: ID of the trial
@@ -115,6 +155,9 @@ def generate_trial_script(trial_id, params, data_yaml, results_dir, epochs):
     
     # Generate custom YAML file
     custom_yaml = generate_custom_yaml(trial_id, params, results_dir)
+    
+    # Detect the best available device
+    device = detect_device()
     
     # Determine advanced parameters (exclude basic architecture params)
     basic_params = ["depth_multiple", "width_multiple", "img_size", "model_type", "kernel_size"]
@@ -139,12 +182,51 @@ import json
 # Start timer for performance measurement
 start_time = time.time()
 
+def detect_device():
+    \"\"\"Detect the best available device for training.\"\"\"
+    try:
+        import torch
+        
+        # Check for NVIDIA CUDA
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            if device_count > 0:
+                try:
+                    test_tensor = torch.randn(2, 2).cuda()
+                    del test_tensor
+                    print(f"✅ CUDA device detected: {{torch.cuda.get_device_name(0)}}")
+                    return 0  # Use device ID 0
+                except Exception as e:
+                    print(f"⚠️  CUDA detected but not functional: {{e}}")
+        
+        # Check for Apple MPS
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            try:
+                test_tensor = torch.randn(2, 2).to('mps')
+                del test_tensor
+                print("✅ MPS device detected")
+                return 'mps'
+            except Exception as e:
+                print(f"⚠️  MPS detected but not functional: {{e}}")
+        
+        # Fallback to CPU
+        print("ℹ️  Using CPU device")
+        return 'cpu'
+        
+    except ImportError:
+        print("⚠️  PyTorch not available, using CPU")
+        return 'cpu'
+
 try:
     print(f"Starting Trial {trial_id}")
     print(f"Custom YAML: {custom_yaml}")
     print(f"Data YAML: {data_yaml}")
     print(f"Image size: {img_size}")
     print(f"Epochs: {epochs}")
+    
+    # Detect device
+    device = detect_device()
+    print(f"Using device: {{device}}")
     
     # Verify files exist
     if not os.path.exists('{custom_yaml}'):
@@ -159,7 +241,7 @@ try:
     # Advanced parameters dictionary (filtered)
     advanced_params = {advanced_params}
     
-    # Training parameters
+    # Training parameters with device detection
     train_params = {{
         'data': '{data_yaml}',
         'epochs': {epochs},
@@ -171,7 +253,7 @@ try:
         'patience': 10,  # Early stopping patience
         'save': True,
         'plots': True,
-        'device': 'auto',  # Use available GPU or CPU
+        'device': device,  # Use detected device
         **advanced_params
     }}
     
@@ -214,6 +296,12 @@ try:
             # Create a dummy image tensor
             dummy_img = torch.randn(1, 3, {img_size}, {img_size})
             
+            # Move to appropriate device
+            if device != 'cpu' and device != 'mps':
+                dummy_img = dummy_img.cuda()
+            elif device == 'mps':
+                dummy_img = dummy_img.to('mps')
+            
             # Warm up
             for _ in range(5):
                 try:
@@ -221,8 +309,8 @@ try:
                 except:
                     break
             
-            # Measure speed
-            if torch.cuda.is_available():
+            # Synchronize if using CUDA
+            if device != 'cpu' and device != 'mps' and torch.cuda.is_available():
                 torch.cuda.synchronize()
             
             start_inference = time.time()
@@ -232,7 +320,8 @@ try:
                 except:
                     break
                     
-            if torch.cuda.is_available():
+            # Synchronize again if using CUDA
+            if device != 'cpu' and device != 'mps' and torch.cuda.is_available():
                 torch.cuda.synchronize()
                 
             total_inference_time = time.time() - start_inference
@@ -259,7 +348,7 @@ try:
     else:
         # Try to get metrics from validation results
         try:
-            val_results = model.val(data='{data_yaml}', verbose=False)
+            val_results = model.val(data='{data_yaml}', verbose=False, device=device)
             if hasattr(val_results, 'box'):
                 metrics_dict = {{
                     'map50': getattr(val_results.box, 'map50', 0) or 0,
@@ -284,7 +373,8 @@ try:
         'fps': fps,
         'inference_time_ms': inference_time_ms,
         'trial_id': {trial_id},
-        'trial_success': True
+        'trial_success': True,
+        'device_used': str(device)
     }}
     
     # Calculate combined score (adjust weights based on priorities)
@@ -310,6 +400,7 @@ try:
         json.dump(metrics, f, indent=2, default=str)
     
     print(f"\\nTrial {trial_id} Results:")
+    print(f"  Device: {{device}}")
     print(f"  mAP50: {{metrics['map50']:.4f}}")
     print(f"  mAP50-95: {{metrics['map50_95']:.4f}}")
     print(f"  Precision: {{metrics['precision']:.4f}}")
@@ -339,7 +430,8 @@ except Exception as e:
         'combined_score': 0,
         'trial_id': {trial_id},
         'trial_success': False,
-        'error_message': str(e)
+        'error_message': str(e),
+        'device_used': 'unknown'
     }}
     
     with open('{trial_dir}/metrics.json', 'w') as f:
@@ -354,7 +446,7 @@ except Exception as e:
 
 def run_trial(trial_id, params, data_yaml, results_dir, epochs):
     """
-    Run a single trial with the given parameters.
+    Run a single trial with the given parameters and enhanced device detection.
     
     Args:
         trial_id: ID of the trial
@@ -367,12 +459,16 @@ def run_trial(trial_id, params, data_yaml, results_dir, epochs):
         dict or None: Results of the trial, or None if the trial failed
     """
     print(f"\n" + "="*60)
-    print(f"STARTING TRIAL {trial_id}")
+    print(f"STARTING TRIAL {trial_id} - ENHANCED VERSION")
     print("="*60)
     
     print("Trial Parameters:")
     for key, value in params.items():
         print(f"  {key}: {value}")
+    
+    # Detect device before starting
+    device = detect_device()
+    print(f"Detected device: {device}")
     
     # Generate the trial script
     trial_script = generate_trial_script(trial_id, params, data_yaml, results_dir, epochs)
@@ -410,6 +506,7 @@ def run_trial(trial_id, params, data_yaml, results_dir, epochs):
                 metrics = load_json(metrics_file)
                 if metrics and metrics.get('trial_success', False):
                     print(f"Results Summary:")
+                    print(f"  Device Used: {metrics.get('device_used', 'unknown')}")
                     print(f"  mAP50-95: {metrics.get('map50_95', 0):.4f}")
                     print(f"  FPS: {metrics.get('fps', 0):.2f}")
                     print(f"  Model Size: {metrics.get('model_size_mb', 0):.2f} MB")
