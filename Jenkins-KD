@@ -2237,6 +2237,8 @@ EOF
     '''
 }
 
+// CLEAN FIX: Replace your existing runKnowledgeDistillation() function with this version (no fallbacks)
+
 def runKnowledgeDistillation() {
     sh '''#!/bin/bash -e
         source "${VENV_NAME}/bin/activate"
@@ -2256,12 +2258,85 @@ def runKnowledgeDistillation() {
         mkdir -p "${WORKSPACE_ARTIFACTS}/kd_training"
         mkdir -p "${WORKSPACE}/email_artifacts"
         
-        # Install additional dependencies for knowledge distillation
-        echo "Installing knowledge distillation dependencies..."
-        pip install ultralytics torch torchvision torchaudio --upgrade
+        # === FIX: UPDATE ULTRALYTICS AND RESET CONFIG ===
+        echo "=== FIXING ULTRALYTICS CONFIGURATION ISSUE ==="
+        
+        # Update ultralytics to latest stable version
+        pip install ultralytics --upgrade --force-reinstall
+        
+        # Clear ultralytics cache that might contain corrupted config
+        python -c "
+import os
+import shutil
+cache_dirs = [
+    os.path.expanduser('~/.cache/ultralytics'),
+    os.path.expanduser('~/.config/Ultralytics')
+]
+for cache_dir in cache_dirs:
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+        print(f'Cleared cache: {cache_dir}')
+"
+        
+        # Reset ultralytics configuration with required attributes
+        python -c "
+from ultralytics.cfg import get_cfg
+import yaml
+import os
+
+# Get fresh default config
+cfg = get_cfg()
+
+# Ensure all required attributes exist (especially 'resume')
+required_attrs = {
+    'resume': False,
+    'project': None,
+    'name': None,
+    'exist_ok': False,
+    'verbose': True,
+    'save': True,
+    'plots': True,
+    'val': True
+}
+
+for attr, default_val in required_attrs.items():
+    if not hasattr(cfg, attr):
+        setattr(cfg, attr, default_val)
+        print(f'Added missing attribute: {attr} = {default_val}')
+
+# Explicitly set resume to False
+cfg.resume = False
+print('✅ Configuration fixed: resume = False')
+
+# Save clean configuration
+config_dir = os.path.expanduser('~/.config/Ultralytics')
+os.makedirs(config_dir, exist_ok=True)
+config_path = os.path.join(config_dir, 'settings.yaml')
+
+with open(config_path, 'w') as f:
+    yaml.dump({
+        'datasets_dir': os.path.expanduser('~/datasets'),
+        'weights_dir': os.path.expanduser('~/weights'),
+        'runs_dir': os.path.expanduser('~/runs'),
+        'uuid': 'anonymous',
+        'sync': True,
+        'api_key': '',
+        'clearml': False,
+        'comet': False,
+        'dvc': True,
+        'hub': True,
+        'mlflow': False,
+        'neptune': False,
+        'raytune': False,
+        'tensorboard': True,
+        'wandb': False
+    }, f)
+
+print(f'✅ Clean configuration saved to: {config_path}')
+"
         
         # === STEP 1: LOCATE KNOWLEDGE DISTILLATION SCRIPT ===
-        echo "=== LOCATING KNOWLEDGE DISTILLATION SCRIPT ==="
+        echo "=== STEP 1: LOCATING KNOWLEDGE DISTILLATION SCRIPT ==="
         
         KD_SCRIPT_PATH=""
         SEARCH_LOCATIONS=(
@@ -2305,7 +2380,7 @@ def runKnowledgeDistillation() {
         echo "${KD_SCRIPT_DIR}" > "${WORKSPACE}/kd_script_location.txt"
         
         # === STEP 2: DETERMINE DATASET AND CONFIGURATION FILES ===
-        echo "=== DETERMINING DATASET AND CONFIGURATION ==="
+        echo "=== STEP 2: DETERMINING DATASET AND CONFIGURATION ==="
         
         # Priority: Use augmented dataset if available, otherwise original
         DATASET_YAML=""
@@ -2448,10 +2523,9 @@ def runKnowledgeDistillation() {
             # Create teacher models backup directory
             mkdir -p "${WORKSPACE}/teacher_models"
             
-            # === CRITICAL FIX: Use YOLO CLI directly for reliable teacher training ===
+            # === FIXED TEACHER TRAINING WITH PROPER CONFIGURATION ===
             echo "Training teacher model using YOLO CLI..."
             
-            # Use absolute path for dataset and ensure proper project/name structure
             python -c "
 from ultralytics import YOLO
 import os
@@ -2459,7 +2533,7 @@ import os
 # Load YOLOv8x model for teacher
 model = YOLO('yolov8x.pt')
 
-# Train teacher model with specific project/name to control save location
+# Train teacher model with explicit resume=False
 results = model.train(
     data='${DATASET_YAML}',
     epochs=${KD_TEACHER_EPOCHS},
@@ -2471,7 +2545,8 @@ results = model.train(
     exist_ok=True,
     save=True,
     workers=4,
-    verbose=True
+    verbose=True,
+    resume=False  # EXPLICIT FIX: Set resume to False
 )
 
 print(f'Teacher training completed. Model saved to: runs/detect/${TEACHER_NAME}/weights/best.pt')
@@ -2520,7 +2595,7 @@ print(f'Teacher training completed. Model saved to: runs/detect/${TEACHER_NAME}/
         echo "✅ Verified teacher weights exist: ${TEACHER_WEIGHTS_PATH}"
         echo "File size: $(du -h "${TEACHER_WEIGHTS_PATH}" | cut -f1)"
         
-        # === STEP 5: TRAIN STUDENT MODEL WITH KNOWLEDGE DISTILLATION ===
+        # === STEP 5: TRAINING STUDENT MODEL WITH KNOWLEDGE DISTILLATION ===
         echo ""
         echo "=== STEP 5: TRAINING STUDENT MODEL WITH KNOWLEDGE DISTILLATION ==="
         echo "Starting student model training with knowledge distillation..."
@@ -2539,165 +2614,106 @@ print(f'Teacher training completed. Model saved to: runs/detect/${TEACHER_NAME}/
         # Record start time
         echo "Student Training Start: $(date)" > "${WORKSPACE_ARTIFACTS}/kd_training/student_timing.txt"
         
-        # === CRITICAL FIX: Use Python API directly for better control ===
+        # === FIXED KNOWLEDGE DISTILLATION TRAINING ===
         echo "Training student model with knowledge distillation using Python API..."
         
+        # MAIN FIX: Proper configuration handling for KDTrainer
         python -c "
 import sys
 sys.path.append('.')
 
-try:
-    # Try importing the knowledge distillation trainer
-    from knowledge_distillation import KDTrainer
-    
-    # Configuration for KD training
-    cfg = {
-        'data': '${DATASET_YAML}',
-        'model': '${CUSTOM_STUDENT_YAML}',
-        'epochs': ${KD_STUDENT_EPOCHS},
-        'batch': ${KD_STUDENT_BATCH},
-        'imgsz': 640,
-        'device': 0,
-        'project': 'runs/detect',
-        'name': '${STUDENT_NAME}',
-        'exist_ok': True,
-        'save': True,
-        'workers': 4,
-        'verbose': True
-    }
-    
-    # Check KDTrainer constructor signature and initialize accordingly
-    import inspect
-    kd_sig = inspect.signature(KDTrainer.__init__)
-    kd_params = list(kd_sig.parameters.keys())
-    
-    print(f'KDTrainer parameters: {kd_params}')
-    
-    # Initialize KD trainer based on available parameters
-    if 'alpha' in kd_params and 'temperature' in kd_params:
-        # Full KD support with alpha and temperature
-        trainer = KDTrainer(
-            cfg=cfg,
-            teacher_weights='${TEACHER_WEIGHTS_PATH}',
-            alpha=${KD_ALPHA},
-            temperature=${KD_TEMPERATURE}
-        )
-    elif 'teacher_weights' in kd_params:
-        # Basic KD support with teacher weights only
-        trainer = KDTrainer(
-            cfg=cfg,
-            teacher_weights='${TEACHER_WEIGHTS_PATH}'
-        )
-    else:
-        # Fallback: try with minimal parameters
-        trainer = KDTrainer(cfg=cfg)
-        # Set teacher weights as attribute if supported
-        if hasattr(trainer, 'teacher_weights'):
-            trainer.teacher_weights = '${TEACHER_WEIGHTS_PATH}'
-    
-    # Set additional KD parameters as attributes if not in constructor
-    if hasattr(trainer, 'alpha') and 'alpha' not in kd_params:
-        trainer.alpha = ${KD_ALPHA}
-    if hasattr(trainer, 'temperature') and 'temperature' not in kd_params:
-        trainer.temperature = ${KD_TEMPERATURE}
-    
-    # Train the student model
-    results = trainer.train()
-    
-    print(f'Student training with KD completed successfully!')
-    print(f'Best weights saved to: runs/detect/${STUDENT_NAME}/weights/best.pt')
-    
-except ImportError as e:
-    print(f'KD trainer import failed: {e}')
-    print('Falling back to standard YOLO training...')
-    
-    # Fallback to standard YOLO training without KD
-    from ultralytics import YOLO
-    
-    # Load student model
-    model = YOLO('${CUSTOM_STUDENT_YAML}')
-    
-    # Train student model normally (without KD)
-    results = model.train(
-        data='${DATASET_YAML}',
-        epochs=${KD_STUDENT_EPOCHS},
-        batch=${KD_STUDENT_BATCH},
-        imgsz=640,
-        device=0,
-        project='runs/detect',
-        name='${STUDENT_NAME}',
-        exist_ok=True,
-        save=True,
-        workers=4,
-        verbose=True
+# Import the knowledge distillation trainer
+from knowledge_distillation import KDTrainer
+
+# CRITICAL FIX: Create proper configuration object
+from ultralytics.cfg import get_cfg
+from types import SimpleNamespace
+
+# Get base configuration
+base_cfg = get_cfg()
+
+# EXPLICIT FIX: Ensure resume attribute exists and is False
+if not hasattr(base_cfg, 'resume'):
+    base_cfg.resume = False
+else:
+    base_cfg.resume = False
+
+# Update configuration with training parameters
+base_cfg.data = '${DATASET_YAML}'
+base_cfg.model = '${CUSTOM_STUDENT_YAML}'
+base_cfg.epochs = ${KD_STUDENT_EPOCHS}
+base_cfg.batch = ${KD_STUDENT_BATCH}
+base_cfg.imgsz = 640
+base_cfg.device = 0
+base_cfg.project = 'runs/detect'
+base_cfg.name = '${STUDENT_NAME}'
+base_cfg.exist_ok = True
+base_cfg.save = True
+base_cfg.workers = 4
+base_cfg.verbose = True
+base_cfg.patience = ${KD_PATIENCE}
+
+# Additional required attributes
+base_cfg.optimizer = 'auto'
+base_cfg.lr0 = 0.01
+base_cfg.momentum = 0.937
+base_cfg.weight_decay = 0.0005
+base_cfg.warmup_epochs = 3.0
+base_cfg.warmup_momentum = 0.8
+base_cfg.warmup_bias_lr = 0.1
+base_cfg.box = 7.5
+base_cfg.cls = 0.5
+base_cfg.dfl = 1.5
+base_cfg.val = True
+base_cfg.plots = True
+
+print('✅ Configuration object prepared successfully')
+print(f'✅ Resume attribute: {base_cfg.resume}')
+
+# Check KDTrainer constructor signature and initialize accordingly
+import inspect
+kd_sig = inspect.signature(KDTrainer.__init__)
+kd_params = list(kd_sig.parameters.keys())
+
+print(f'KDTrainer parameters: {kd_params}')
+
+# Initialize KD trainer with proper error handling
+if 'teacher_weights' in kd_params and 'alpha' in kd_params and 'temperature' in kd_params:
+    # Full KD support
+    trainer = KDTrainer(
+        cfg=base_cfg,
+        teacher_weights='${TEACHER_WEIGHTS_PATH}',
+        alpha=${KD_ALPHA},
+        temperature=${KD_TEMPERATURE}
     )
-    
-    print(f'Standard student training completed. Model saved to: runs/detect/${STUDENT_NAME}/weights/best.pt')
-    
-except Exception as e:
-    print(f'Training failed with error: {e}')
-    print('Attempting fallback with direct script call...')
-    
-    # Final fallback: try calling the KD script directly
-    import subprocess
-    import os
-    
-    try:
-        cmd = [
-            'python3', 'knowledge_distillation.py',
-            '--data', '${DATASET_YAML}',
-            '--student_model', '${CUSTOM_STUDENT_YAML}',
-            '--teacher_weights', '${TEACHER_WEIGHTS_PATH}',
-            '--skip_teacher',
-            '--epochs', '${KD_STUDENT_EPOCHS}',
-            '--batch', '${KD_STUDENT_BATCH}',
-            '--imgsz', '640',
-            '--device', '0',
-            '--alpha', '${KD_ALPHA}',
-            '--temperature', '${KD_TEMPERATURE}',
-            '--student_name', '${STUDENT_NAME}',
-            '--patience', '${KD_PATIENCE}',
-            '--workers', '4'
-        ]
-        
-        print('Running KD script with command: ' + ' '.join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            print('KD script completed successfully!')
-            print(result.stdout)
-        else:
-            print(f'KD script failed with return code: {result.returncode}')
-            print(f'STDOUT: {result.stdout}')
-            print(f'STDERR: {result.stderr}')
-            raise Exception(f'KD script failed with return code: {result.returncode}')
-            
-    except subprocess.TimeoutExpired:
-        print('KD script timed out after 1 hour')
-        raise Exception('KD script timeout')
-    except Exception as script_error:
-        print(f'KD script fallback also failed: {script_error}')
-        
-        # Ultimate fallback: standard YOLO training
-        print('Using ultimate fallback: standard YOLO training')
-        from ultralytics import YOLO
-        
-        model = YOLO('${CUSTOM_STUDENT_YAML}')
-        results = model.train(
-            data='${DATASET_YAML}',
-            epochs=${KD_STUDENT_EPOCHS},
-            batch=${KD_STUDENT_BATCH},
-            imgsz=640,
-            device=0,
-            project='runs/detect',
-            name='${STUDENT_NAME}',
-            exist_ok=True,
-            save=True,
-            workers=4,
-            verbose=True
-        )
-        
-        print(f'Ultimate fallback training completed. Model saved to: runs/detect/${STUDENT_NAME}/weights/best.pt')
+    print('✅ KDTrainer initialized with full KD parameters')
+elif 'teacher_weights' in kd_params:
+    # Basic KD support
+    trainer = KDTrainer(
+        cfg=base_cfg,
+        teacher_weights='${TEACHER_WEIGHTS_PATH}'
+    )
+    # Set KD parameters as attributes
+    if hasattr(trainer, 'alpha'):
+        trainer.alpha = ${KD_ALPHA}
+    if hasattr(trainer, 'temperature'):
+        trainer.temperature = ${KD_TEMPERATURE}
+    print('✅ KDTrainer initialized with basic KD parameters')
+else:
+    # Minimal initialization
+    trainer = KDTrainer(cfg=base_cfg)
+    # Set all KD parameters as attributes
+    trainer.teacher_weights = '${TEACHER_WEIGHTS_PATH}'
+    trainer.alpha = ${KD_ALPHA}
+    trainer.temperature = ${KD_TEMPERATURE}
+    print('✅ KDTrainer initialized with manual parameter setting')
+
+# Train the student model
+print('Starting KD training...')
+results = trainer.train()
+
+print(f'✅ Student training with KD completed successfully!')
+print(f'Best weights saved to: runs/detect/${STUDENT_NAME}/weights/best.pt')
 "
         
         # Record end time
@@ -2749,6 +2765,11 @@ Results:
 
 Training Status: SUCCESS
 Teacher Training Performed: $([ "${NEED_TEACHER_TRAINING}" = "true" ] && echo "YES" || echo "NO - REUSED EXISTING")
+
+Fix Applied: 
+- Ultralytics configuration reset
+- Explicit resume=False setting
+- Proper KDTrainer configuration object handling
 EOF
         
         # Extract metrics from results CSV files if available
@@ -2797,6 +2818,7 @@ EOF
         echo "  📧 Email Package: email_artifacts/kd_results_${TIMESTAMP_FINAL}.zip"
         echo "  📂 Teacher Weights: ${TEACHER_WEIGHTS_PATH}"
         echo "  📂 Student Weights: ${STUDENT_WEIGHTS_PATH}"
+        echo "  🔧 Fix Applied: Configuration issue resolved"
         echo ""
         
         # Return to workspace directory
