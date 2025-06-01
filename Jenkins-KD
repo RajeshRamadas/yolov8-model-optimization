@@ -161,7 +161,6 @@ pipeline {
     }
     
     options {
-        timeout(time:30, unit: 'HOURS')
         buildDiscarder(logRotator(numToKeepStr: '10'))
         disableConcurrentBuilds()
         timestamps()
@@ -583,9 +582,9 @@ pipeline {
 					echo "Expected completion: Variable based on workload"
 					echo "=" * 50
 					
-					timeout(time: 30, unit: 'HOURS') { // 1 day 6 hours
-						runNeuralArchitectureSearch()
-					}
+					
+					runNeuralArchitectureSearch()
+					
 				}
 			}
 			post {
@@ -2057,7 +2056,7 @@ EOF
                     
                     # Try to evaluate with YOLO
                     set +e
-                    timeout 300 python -c "
+                    python -c "
 import sys
 try:
     from ultralytics import YOLO
@@ -2100,7 +2099,7 @@ except Exception as e:
                     
                     # Try to evaluate with YOLO
                     set +e
-                    timeout 300 python -c "
+                    python -c "
 import sys
 try:
     from ultralytics import YOLO
@@ -2145,7 +2144,7 @@ except Exception as e:
                 
                 # Try to evaluate with YOLO  
                 set +e
-                timeout 300 python -c "
+                python -c "
 import sys
 try:
     from ultralytics import YOLO
@@ -2662,7 +2661,7 @@ except Exception as e:
         ]
         
         print('Running KD script with command: ' + ' '.join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode == 0:
             print('KD script completed successfully!')
@@ -2980,7 +2979,7 @@ EOF
             
             # Execute with timeout and error handling
             set +e
-            eval "timeout 7200 ${NAS_CMD}"
+            eval "${NAS_CMD}"
             NAS_EXIT_CODE=$?
             set -e
             
@@ -3378,7 +3377,7 @@ CSVEOF
                             
                             # Try to evaluate with YOLO
                             set +e
-                            timeout 300 python -c "
+                            python -c "
 import sys
 try:
     from ultralytics import YOLO
@@ -3421,7 +3420,7 @@ except Exception as e:
                                 SIZE_MB=$(du -m "${TEACHER_DIR}/weights/best.pt" | cut -f1)
                                 
                                 set +e
-                                timeout 300 python -c "
+                                python -c "
 import sys
 try:
     from ultralytics import YOLO
@@ -3465,7 +3464,7 @@ except Exception as e:
                             
                             # Try to evaluate with YOLO
                             set +e
-                            timeout 300 python -c "
+                            python -c "
 import sys
 try:
     from ultralytics import YOLO
@@ -3508,7 +3507,7 @@ except Exception as e:
                                 SIZE_MB=$(du -m "${STUDENT_DIR}/weights/best.pt" | cut -f1)
                                 
                                 set +e
-                                timeout 300 python -c "
+                                python -c "
 import sys
 try:
     from ultralytics import YOLO
@@ -3557,7 +3556,7 @@ except Exception as e:
                             
                             # Try to evaluate with YOLO  
                             set +e
-                            timeout 300 python -c "
+                            python -c "
 import sys
 try:
     from ultralytics import YOLO

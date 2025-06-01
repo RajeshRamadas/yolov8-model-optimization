@@ -1,5 +1,5 @@
 # Core ML/DL dependencies
-ultralytics>=8.0.0       # For YOLOv8 models
+ultralytics==8.0.196       # For YOLOv8 models
 torch>=1.12.0            # PyTorch for deep learning
 torchvision>=0.13.0      # Vision utilities for PyTorch
 
