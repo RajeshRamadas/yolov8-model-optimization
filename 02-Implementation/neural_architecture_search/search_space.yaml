@@ -1,4 +1,4 @@
-# YOLOv8 Neural Architecture Search Configuration
+# YOLOv8 Neural Architecture Search Configuration - FIXED VERSION
 
 # Basic search space parameters
 basic_search_space:
@@ -17,10 +17,12 @@ basic_search_space:
     - 448
     - 640
   kernel_size:
-    - 1
     - 3
     - 5
     - 7
+  model_type:
+    - yolov8n
+    - yolov8s
 
 # Advanced search parameters (combined with basic when advanced_search=True)
 advanced_search_space:
@@ -41,9 +43,9 @@ advanced_search_space:
     - 0.95
     - 0.99
   weight_decay:
+    - 0.0001
     - 0.0005
     - 0.001
-    - 0.0001
   warmup_epochs:
     - 1.0
     - 3.0
@@ -55,9 +57,6 @@ advanced_search_space:
     - 0.0
     - 0.5
     - 1.0
-  model_type:
-    - yolov8n
-    - yolov8s
 
 # Objective function weights
 objective_weights:
@@ -67,8 +66,8 @@ objective_weights:
 
 # Default parameters for the search process
 defaults:
-  trials: 10
-  epochs: 50
+  trials: 5
+  epochs: 10  # Reduced for faster testing
   results_dir: "nas_results"
-  parallel: 1
-  objective: "map"  # Can be "map", "latency", "size", or "combined"
+  parallel: 1  # Reduced to avoid resource conflicts
+  objective: "combined"  # Can be "map", "latency", "size", or "combined"
