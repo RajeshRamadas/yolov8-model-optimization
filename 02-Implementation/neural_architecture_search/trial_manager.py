@@ -388,24 +388,8 @@ try:
     # Load the custom model with proper error handling
     print("Loading custom model...")
     try:
-        # First, try to set weights_only=False globally for ultralytics
-        import ultralytics
-        if hasattr(ultralytics, 'checks'):
-            # Try to disable weights_only checking
-            try:
-                import torch._utils
-                original_load = torch.load
-                def patched_load(*args, **kwargs):
-                    if 'weights_only' not in kwargs:
-                        kwargs['weights_only'] = False
-                    return original_load(*args, **kwargs)
-                torch.load = patched_load
-                print("✅ Applied torch.load patch for compatibility")
-            except Exception as patch_e:
-                print(f"⚠️  Could not patch torch.load: {patch_e}")
-        
         model = YOLO('{custom_yaml}')
-        print("✅ Model loaded successfully")
+        print("✅ Custom model loaded successfully")
     except Exception as e:
         print(f"❌ Error loading custom model: {{e}}")
         # Try loading a standard model as fallback
