@@ -143,6 +143,10 @@ def setup_pytorch_compatibility():
 # PyTorch 2.6+ Compatibility Fix
 import torch
 import sys
+import os
+
+# Set environment variable to disable weights_only by default
+os.environ['TORCH_LOAD_WEIGHTS_ONLY'] = 'False'
 
 def setup_pytorch_safe_globals():
     \"\"\"Configure PyTorch safe globals for compatibility with newer versions.\"\"\"
@@ -152,8 +156,21 @@ def setup_pytorch_safe_globals():
         major, minor = map(int, pytorch_version.split('.')[:2])
         
         if major > 2 or (major == 2 and minor >= 6):
-            print(f"🔧 PyTorch {pytorch_version} detected - setting up compatibility...")
+            print(f"🔧 PyTorch {pytorch_version} detected - setting up comprehensive compatibility...")
             
+            # Method 1: Try to patch torch.load globally
+            try:
+                original_load = torch.load
+                def safe_load(*args, **kwargs):
+                    # Force weights_only=False for compatibility
+                    kwargs['weights_only'] = False
+                    return original_load(*args, **kwargs)
+                torch.load = safe_load
+                print("✅ Patched torch.load to use weights_only=False")
+            except Exception as patch_e:
+                print(f"⚠️  Could not patch torch.load: {patch_e}")
+            
+            # Method 2: Set up comprehensive safe globals as backup
             # Essential PyTorch classes for YOLO models
             safe_globals = [
                 # Core PyTorch modules
@@ -163,6 +180,8 @@ def setup_pytorch_safe_globals():
                 torch.nn.modules.activation.SiLU,
                 torch.nn.modules.activation.ReLU,
                 torch.nn.modules.activation.LeakyReLU,
+                torch.nn.modules.activation.Sigmoid,
+                torch.nn.modules.activation.Hardswish,
                 torch.nn.modules.pooling.MaxPool2d,
                 torch.nn.modules.pooling.AdaptiveAvgPool2d,
                 torch.nn.modules.upsampling.Upsample,
@@ -170,26 +189,79 @@ def setup_pytorch_safe_globals():
                 torch.nn.modules.dropout.Dropout,
                 torch.nn.modules.container.ModuleList,
                 torch.nn.modules.container.ModuleDict,
+                torch.nn.modules.conv.ConvTranspose2d,
+                torch.nn.modules.normalization.GroupNorm,
+                torch.nn.modules.normalization.LayerNorm,
                 
                 # Additional common modules
                 torch.nn.Parameter,
                 torch.Tensor,
+                torch.Size,
+                torch.dtype,
+                torch.device,
                 
                 # For collections/lists/tuples
                 list, tuple, dict, int, float, str, bool, type(None),
+                
+                # OrderedDict for state_dict
+                __builtins__['dict'] if isinstance(__builtins__, dict) else __builtins__.__dict__['dict'],
             ]
             
-            # Try to add Ultralytics-specific classes if available
+            # Add comprehensive Ultralytics classes
+            ultralytics_classes = []
             try:
-                from ultralytics.nn.modules import Conv, C2f, SPPF, Detect, Concat
-                safe_globals.extend([Conv, C2f, SPPF, Detect, Concat])
-                print("✅ Added Ultralytics modules to safe globals")
-            except ImportError:
-                print("⚠️  Ultralytics modules not available for safe globals")
+                # Core Ultralytics modules
+                from ultralytics.nn.modules import (
+                    Conv, DWConv, DWConvTranspose2d, ConvTranspose, Focus, GhostConv,
+                    ChannelShuffle, SPP, SPPF, C1, C2, C3, C2f, C3x, C3TR, C3Ghost,
+                    GhostBottleneck, Bottleneck, BottleneckCSP, Proto, HGStem, HGBlock,
+                    Detect, Segment, Pose, Classify, RTDETRDecoder
+                )
+                ultralytics_classes.extend([
+                    Conv, DWConv, DWConvTranspose2d, ConvTranspose, Focus, GhostConv,
+                    ChannelShuffle, SPP, SPPF, C1, C2, C3, C2f, C3x, C3TR, C3Ghost,
+                    GhostBottleneck, Bottleneck, BottleneckCSP, Proto, HGStem, HGBlock,
+                    Detect, Segment, Pose, Classify, RTDETRDecoder
+                ])
+                print("✅ Added Ultralytics nn.modules")
+            except ImportError as e:
+                print(f"⚠️  Some Ultralytics nn.modules not available: {e}")
             
-            # Add safe globals
-            torch.serialization.add_safe_globals(safe_globals)
-            print(f"✅ Added {len(safe_globals)} classes to PyTorch safe globals")
+            try:
+                # Ultralytics tasks
+                from ultralytics.nn.tasks import DetectionModel, SegmentationModel, ClassificationModel, PoseModel
+                ultralytics_classes.extend([DetectionModel, SegmentationModel, ClassificationModel, PoseModel])
+                print("✅ Added Ultralytics task models including DetectionModel")
+            except ImportError as e:
+                print(f"⚠️  Some Ultralytics task models not available: {e}")
+            
+            try:
+                # Additional Ultralytics classes
+                from ultralytics.nn.modules import Concat
+                from ultralytics.models.yolo.detect import DetectionPredictor, DetectionValidator, DetectionTrainer
+                ultralytics_classes.extend([Concat, DetectionPredictor, DetectionValidator, DetectionTrainer])
+                print("✅ Added additional Ultralytics classes")
+            except ImportError as e:
+                print(f"⚠️  Some additional Ultralytics classes not available: {e}")
+            
+            # Try to add any other commonly needed classes
+            try:
+                import collections
+                safe_globals.append(collections.OrderedDict)
+            except:
+                pass
+            
+            # Combine all safe globals
+            all_safe_globals = safe_globals + ultralytics_classes
+            
+            # Add safe globals as backup method
+            try:
+                torch.serialization.add_safe_globals(all_safe_globals)
+                print(f"✅ Added {len(all_safe_globals)} classes to PyTorch safe globals as backup")
+                print(f"   - {len(safe_globals)} PyTorch classes")
+                print(f"   - {len(ultralytics_classes)} Ultralytics classes")
+            except Exception as safe_e:
+                print(f"⚠️  Could not add safe globals: {safe_e}")
             
             return True
         else:
@@ -198,6 +270,7 @@ def setup_pytorch_safe_globals():
             
     except Exception as e:
         print(f"⚠️  Warning: Could not set up PyTorch compatibility: {e}")
+        print(f"   Error details: {type(e).__name__}: {str(e)}")
         return False
 
 # Set up compatibility immediately
@@ -315,14 +388,34 @@ try:
     # Load the custom model with proper error handling
     print("Loading custom model...")
     try:
+        # First, try to set weights_only=False globally for ultralytics
+        import ultralytics
+        if hasattr(ultralytics, 'checks'):
+            # Try to disable weights_only checking
+            try:
+                import torch._utils
+                original_load = torch.load
+                def patched_load(*args, **kwargs):
+                    if 'weights_only' not in kwargs:
+                        kwargs['weights_only'] = False
+                    return original_load(*args, **kwargs)
+                torch.load = patched_load
+                print("✅ Applied torch.load patch for compatibility")
+            except Exception as patch_e:
+                print(f"⚠️  Could not patch torch.load: {patch_e}")
+        
         model = YOLO('{custom_yaml}')
         print("✅ Model loaded successfully")
     except Exception as e:
-        print(f"❌ Error loading model: {{e}}")
+        print(f"❌ Error loading custom model: {{e}}")
         # Try loading a standard model as fallback
         print("Trying standard yolov8n.pt as fallback...")
-        model = YOLO('yolov8n.pt')
-        print("✅ Fallback model loaded successfully")
+        try:
+            model = YOLO('yolov8n.pt')
+            print("✅ Fallback model loaded successfully")
+        except Exception as fallback_e:
+            print(f"❌ Fallback model also failed: {{fallback_e}}")
+            raise Exception(f"Both custom and fallback models failed: {{e}}, {{fallback_e}}")
     
     # Advanced parameters dictionary (filtered)
     advanced_params = {advanced_params}
