@@ -1,7 +1,7 @@
-# trial_manager.py - ENHANCED VERSION with device detection fixes
+# trial_manager.py - ENHANCED VERSION with PyTorch 2.6 compatibility fixes
 """
 Module for managing trial execution in Neural Architecture Search.
-ENHANCED VERSION - Resolves CUDA detection and device assignment issues.
+ENHANCED VERSION - Resolves CUDA detection, device assignment, and PyTorch 2.6 compatibility issues.
 """
 
 import os
@@ -50,6 +50,59 @@ def detect_device():
     except ImportError:
         print("⚠️  PyTorch not available, defaulting to CPU")
         return 'cpu'
+
+
+def setup_pytorch_safe_globals():
+    """
+    Setup PyTorch safe globals for weights_only=True compatibility.
+    This fixes PyTorch 2.6 compatibility issues with Ultralytics models.
+    
+    Returns:
+        str: Code to add to trial scripts
+    """
+    return '''
+# PyTorch 2.6 compatibility fix for Ultralytics models
+def setup_torch_safe_globals():
+    """Setup safe globals for PyTorch 2.6 weights_only=True compatibility."""
+    try:
+        import torch
+        from ultralytics.nn.tasks import DetectionModel, SegmentationModel, ClassificationModel, PoseModel
+        
+        # Check if we're using PyTorch 2.6+ with weights_only=True default
+        torch_version = torch.__version__
+        major, minor = map(int, torch_version.split('.')[:2])
+        
+        if major > 2 or (major == 2 and minor >= 6):
+            print(f"PyTorch {torch_version} detected - setting up safe globals for Ultralytics compatibility")
+            
+            # Add Ultralytics model classes to safe globals
+            safe_classes = [DetectionModel, SegmentationModel, ClassificationModel, PoseModel]
+            
+            # Import additional classes that might be needed
+            try:
+                from ultralytics.nn.modules import Conv, C2f, SPPF, Detect, Segment, Classify, Pose
+                safe_classes.extend([Conv, C2f, SPPF, Detect, Segment, Classify, Pose])
+            except ImportError:
+                pass
+            
+            # Import other commonly needed classes
+            try:
+                from ultralytics.nn.modules.block import C1, C2, C3, SPP, Focus
+                safe_classes.extend([C1, C2, C3, SPP, Focus])
+            except ImportError:
+                pass
+            
+            # Add to safe globals
+            torch.serialization.add_safe_globals(safe_classes)
+            print(f"Added {len(safe_classes)} Ultralytics classes to PyTorch safe globals")
+            
+    except Exception as e:
+        print(f"Warning: Could not setup PyTorch safe globals: {e}")
+        print("This may cause issues with PyTorch 2.6+ if using weights_only=True")
+
+# Call the setup function
+setup_torch_safe_globals()
+'''
 
 
 def generate_custom_yaml(trial_id, params, results_dir):
@@ -134,7 +187,7 @@ def generate_custom_yaml(trial_id, params, results_dir):
 
 def generate_trial_script(trial_id, params, data_yaml, results_dir, epochs):
     """
-    Generate a Python script for running a single trial with enhanced device detection.
+    Generate a Python script for running a single trial with enhanced device detection and PyTorch 2.6 compatibility.
     
     Args:
         trial_id: ID of the trial
@@ -169,6 +222,9 @@ def generate_trial_script(trial_id, params, data_yaml, results_dir, epochs):
     # Create a Python script for this trial
     trial_script = os.path.join(trial_dir, "run_trial.py")
     
+    # Get PyTorch safe globals setup code
+    safe_globals_setup = setup_pytorch_safe_globals()
+    
     with open(trial_script, 'w') as f:
         f.write(f"""
 import time
@@ -176,11 +232,12 @@ import traceback
 import sys
 import os
 from pathlib import Path
-from ultralytics import YOLO
 import json
 
 # Start timer for performance measurement
 start_time = time.time()
+
+{safe_globals_setup}
 
 def detect_device():
     \"\"\"Detect the best available device for training.\"\"\"
@@ -233,6 +290,9 @@ try:
         raise FileNotFoundError(f"Custom YAML not found: {custom_yaml}")
     if not os.path.exists('{data_yaml}'):
         raise FileNotFoundError(f"Data YAML not found: {data_yaml}")
+    
+    # Import ultralytics after setting up safe globals
+    from ultralytics import YOLO
     
     # Load the custom model
     print("Loading custom model...")

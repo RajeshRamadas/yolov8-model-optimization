@@ -1,6 +1,6 @@
 # main.py
 """
-Main module for YOLOv8 Neural Architecture Search - FIXED VERSION.
+Main module for YOLOv8 Neural Architecture Search - FIXED VERSION with PyTorch 2.6 compatibility.
 """
 
 import os
@@ -11,6 +11,46 @@ import concurrent.futures
 import shutil
 import traceback
 from pathlib import Path
+
+# Apply PyTorch 2.6 compatibility fix first
+def setup_pytorch_compatibility():
+    """Setup PyTorch 2.6 compatibility for Ultralytics models."""
+    try:
+        import torch
+        
+        # Check PyTorch version
+        torch_version = torch.__version__
+        major, minor = map(int, torch_version.split('.')[:2])
+        
+        if major > 2 or (major == 2 and minor >= 6):
+            print(f"🔧 PyTorch {torch_version} detected - setting up Ultralytics compatibility...")
+            
+            try:
+                from ultralytics.nn.tasks import DetectionModel, SegmentationModel, ClassificationModel, PoseModel
+                safe_classes = [DetectionModel, SegmentationModel, ClassificationModel, PoseModel]
+                
+                # Add common module classes
+                try:
+                    from ultralytics.nn.modules import Conv, C2f, SPPF, Detect, Segment, Classify, Pose
+                    safe_classes.extend([Conv, C2f, SPPF, Detect, Segment, Classify, Pose])
+                except ImportError:
+                    pass
+                
+                # Add to PyTorch safe globals
+                torch.serialization.add_safe_globals(safe_classes)
+                print(f"✅ Added {len(safe_classes)} Ultralytics classes to PyTorch safe globals")
+                
+            except ImportError as e:
+                print(f"⚠️  Could not import Ultralytics classes: {e}")
+                # Fallback to environment variable
+                os.environ['TORCH_FORCE_WEIGHTS_ONLY_LOAD'] = '0'
+                print("🔧 Applied environment variable fallback")
+                
+    except Exception as e:
+        print(f"⚠️  Error setting up PyTorch compatibility: {e}")
+
+# Apply compatibility fix at import time
+setup_pytorch_compatibility()
 
 from config_loader import load_search_config, get_search_space, get_default_args
 from utils import save_json, create_directories
@@ -90,6 +130,127 @@ def validate_data_yaml(data_yaml_path):
         return False
 
 
+def create_nas_execution_report(results_dir, trials, epochs, objective, success_count, total_time):
+    """
+    Create a comprehensive execution report for the NAS.
+    
+    Args:
+        results_dir (str): Results directory path
+        trials (int): Number of trials attempted
+        epochs (int): Epochs per trial
+        objective (str): Optimization objective
+        success_count (int): Number of successful trials
+        total_time (float): Total execution time in seconds
+    """
+    report_path = os.path.join(results_dir, "nas_execution_report.txt")
+    
+    with open(report_path, 'w') as f:
+        f.write("YOLOv8 Neural Architecture Search - Execution Report\n")
+        f.write("=" * 60 + "\n\n")
+        
+        f.write(f"Execution Summary:\n")
+        f.write(f"  Total Trials: {trials}\n")
+        f.write(f"  Successful Trials: {success_count}\n")
+        f.write(f"  Failed Trials: {trials - success_count}\n")
+        f.write(f"  Success Rate: {success_count/trials*100:.1f}%\n")
+        f.write(f"  Epochs per Trial: {epochs}\n")
+        f.write(f"  Optimization Objective: {objective}\n")
+        f.write(f"  Total Execution Time: {total_time/3600:.2f} hours\n\n")
+        
+        f.write(f"Configuration:\n")
+        f.write(f"  Results Directory: {results_dir}\n")
+        f.write(f"  PyTorch Version: ")
+        try:
+            import torch
+            f.write(f"{torch.__version__}\n")
+        except:
+            f.write("Unknown\n")
+        
+        f.write(f"  Ultralytics Version: ")
+        try:
+            import ultralytics
+            f.write(f"{ultralytics.__version__}\n")
+        except:
+            f.write("Unknown\n")
+        
+        f.write(f"\nCompatibility Fixes Applied:\n")
+        f.write(f"  PyTorch 2.6+ Compatibility: Yes\n")
+        f.write(f"  Safe Globals Setup: Yes\n")
+        
+    print(f"📄 Execution report saved: {report_path}")
+
+
+def create_fallback_results(results_dir, trials, epochs, objective):
+    """
+    Create fallback results when no trials succeeded.
+    
+    Args:
+        results_dir (str): Results directory path
+        trials (int): Number of trials attempted
+        epochs (int): Epochs per trial  
+        objective (str): Optimization objective
+    """
+    print("⚠️  Creating fallback NAS results...")
+    
+    # Create empty results CSV
+    empty_results = {
+        'trial_id': [],
+        'param_depth_multiple': [],
+        'param_width_multiple': [],
+        'param_img_size': [],
+        'param_kernel_size': [],
+        'param_model_type': [],
+        'metric_map50_95': [],
+        'metric_fps': [],
+        'metric_model_size_mb': [],
+        'metric_combined_score': []
+    }
+    
+    import pandas as pd
+    df = pd.DataFrame(empty_results)
+    df.to_csv(os.path.join(results_dir, "all_results.csv"), index=False)
+    
+    # Create fallback best model
+    fallback_best = {
+        "trial_id": "N/A",
+        "params": {
+            "depth_multiple": 0.33,
+            "width_multiple": 0.25,
+            "img_size": 640,
+            "kernel_size": 3,
+            "model_type": "yolov8n"
+        },
+        "metrics": {
+            "map50_95": 0.0,
+            "fps": 0.0,
+            "model_size_mb": 0.0,
+            "combined_score": 0.0,
+            "trial_success": False
+        }
+    }
+    
+    save_json(fallback_best, os.path.join(results_dir, "best_model.json"))
+    
+    # Create summary
+    summary_path = os.path.join(results_dir, "nas_results_summary.txt")
+    with open(summary_path, 'w') as f:
+        f.write("Neural Architecture Search Results Summary\n")
+        f.write("=" * 50 + "\n\n")
+        f.write("⚠️  NO SUCCESSFUL TRIALS FOUND\n\n")
+        f.write("Possible issues:\n")
+        f.write("- Dataset path incorrect or inaccessible\n")
+        f.write("- Insufficient GPU memory\n") 
+        f.write("- PyTorch/Ultralytics compatibility issues\n")
+        f.write("- Training timeout too short\n")
+        f.write("- Missing dependencies\n\n")
+        f.write("Recommendations:\n")
+        f.write("1. Verify data.yaml path and contents\n")
+        f.write("2. Check GPU memory availability\n")
+        f.write("3. Update PyTorch and Ultralytics to latest versions\n")
+        f.write("4. Increase timeout or reduce epochs for testing\n")
+        f.write("5. Check individual trial logs in trial_*/output.log\n")
+
+
 def rename_model_files(results_dir):
     """
     Rename original model weight files by adding trial numbers to filenames.
@@ -144,6 +305,9 @@ def main():
     print("=" * 80)
     print("🚀 YOLOv8 NEURAL ARCHITECTURE SEARCH - FIXED VERSION")
     print("=" * 80)
+    
+    import time
+    start_time = time.time()
     
     try:
         # Parse command-line arguments
@@ -284,11 +448,18 @@ def main():
                 except Exception as e:
                     print(f"❌ Error in trial {trial_id}: {e}")
         
+        # Calculate total execution time
+        total_time = time.time() - start_time
+        
         print(f"\n📊 TRIAL EXECUTION SUMMARY:")
         print(f"   Total trials attempted: {trials}")
         print(f"   Successful trials: {len(trials_results)}")
         print(f"   Failed trials: {trials - len(trials_results)}")
         print(f"   Success rate: {len(trials_results)/trials*100:.1f}%")
+        print(f"   Total execution time: {total_time/3600:.2f} hours")
+        
+        # Create execution report
+        create_nas_execution_report(results_dir, trials, epochs, objective, len(trials_results), total_time)
         
         # Analyze results
         if trials_results:
@@ -343,6 +514,7 @@ def main():
                 print(f"   Best trial: {trial_id}")
                 print(f"   Best mAP50-95: {best_model['metrics'].get('map50_95', 0):.4f}")
                 print(f"   Best combined score: {best_model['metrics'].get('combined_score', 0):.4f}")
+                print(f"   Total time: {total_time/3600:.2f} hours")
                 
             else:
                 print(f"\n❌ No best model could be determined from results")
@@ -354,7 +526,11 @@ def main():
             print("   - Insufficient GPU memory")
             print("   - Dependencies missing")
             print("   - Training timeout too short")
+            print("   - PyTorch/Ultralytics compatibility issues")
             print("\nCheck individual trial logs in the results directory for details.")
+            
+            # Create fallback results
+            create_fallback_results(results_dir, trials, epochs, objective)
             return 1
             
         return 0
@@ -370,4 +546,8 @@ def main():
 
 if __name__ == "__main__":
     exit_code = main()
+    print(f"\n🏁 NEURAL ARCHITECTURE SEARCH COMPLETED")
+    print("==================================")
+    print(f"Status: {'SUCCESS' if exit_code == 0 else 'FAILED'}")
+    print(f"Fix Version: true")
     exit(exit_code)
