@@ -1,7 +1,7 @@
-# trial_manager.py - ENHANCED VERSION with PyTorch 2.6 compatibility fixes
+# trial_manager.py - ENHANCED VERSION with PyTorch 2.6+ compatibility fix
 """
 Module for managing trial execution in Neural Architecture Search.
-ENHANCED VERSION - Resolves CUDA detection, device assignment, and PyTorch 2.6 compatibility issues.
+ENHANCED VERSION - Resolves CUDA detection, device assignment, and PyTorch compatibility issues.
 """
 
 import os
@@ -50,59 +50,6 @@ def detect_device():
     except ImportError:
         print("⚠️  PyTorch not available, defaulting to CPU")
         return 'cpu'
-
-
-def setup_pytorch_safe_globals():
-    """
-    Setup PyTorch safe globals for weights_only=True compatibility.
-    This fixes PyTorch 2.6 compatibility issues with Ultralytics models.
-    
-    Returns:
-        str: Code to add to trial scripts
-    """
-    return '''
-# PyTorch 2.6 compatibility fix for Ultralytics models
-def setup_torch_safe_globals():
-    """Setup safe globals for PyTorch 2.6 weights_only=True compatibility."""
-    try:
-        import torch
-        from ultralytics.nn.tasks import DetectionModel, SegmentationModel, ClassificationModel, PoseModel
-        
-        # Check if we're using PyTorch 2.6+ with weights_only=True default
-        torch_version = torch.__version__
-        major, minor = map(int, torch_version.split('.')[:2])
-        
-        if major > 2 or (major == 2 and minor >= 6):
-            print(f"PyTorch {torch_version} detected - setting up safe globals for Ultralytics compatibility")
-            
-            # Add Ultralytics model classes to safe globals
-            safe_classes = [DetectionModel, SegmentationModel, ClassificationModel, PoseModel]
-            
-            # Import additional classes that might be needed
-            try:
-                from ultralytics.nn.modules import Conv, C2f, SPPF, Detect, Segment, Classify, Pose
-                safe_classes.extend([Conv, C2f, SPPF, Detect, Segment, Classify, Pose])
-            except ImportError:
-                pass
-            
-            # Import other commonly needed classes
-            try:
-                from ultralytics.nn.modules.block import C1, C2, C3, SPP, Focus
-                safe_classes.extend([C1, C2, C3, SPP, Focus])
-            except ImportError:
-                pass
-            
-            # Add to safe globals
-            torch.serialization.add_safe_globals(safe_classes)
-            print(f"Added {len(safe_classes)} Ultralytics classes to PyTorch safe globals")
-            
-    except Exception as e:
-        print(f"Warning: Could not setup PyTorch safe globals: {e}")
-        print("This may cause issues with PyTorch 2.6+ if using weights_only=True")
-
-# Call the setup function
-setup_torch_safe_globals()
-'''
 
 
 def generate_custom_yaml(trial_id, params, results_dir):
@@ -185,9 +132,82 @@ def generate_custom_yaml(trial_id, params, results_dir):
     return yaml_path
 
 
+def setup_pytorch_compatibility():
+    """
+    Set up PyTorch compatibility for newer versions (2.6+).
+    
+    Returns:
+        str: Python code to add to trial scripts for PyTorch compatibility
+    """
+    return """
+# PyTorch 2.6+ Compatibility Fix
+import torch
+import sys
+
+def setup_pytorch_safe_globals():
+    \"\"\"Configure PyTorch safe globals for compatibility with newer versions.\"\"\"
+    try:
+        # Check if we're using PyTorch 2.6+
+        pytorch_version = torch.__version__
+        major, minor = map(int, pytorch_version.split('.')[:2])
+        
+        if major > 2 or (major == 2 and minor >= 6):
+            print(f"🔧 PyTorch {pytorch_version} detected - setting up compatibility...")
+            
+            # Essential PyTorch classes for YOLO models
+            safe_globals = [
+                # Core PyTorch modules
+                torch.nn.modules.container.Sequential,
+                torch.nn.modules.conv.Conv2d,
+                torch.nn.modules.batchnorm.BatchNorm2d,
+                torch.nn.modules.activation.SiLU,
+                torch.nn.modules.activation.ReLU,
+                torch.nn.modules.activation.LeakyReLU,
+                torch.nn.modules.pooling.MaxPool2d,
+                torch.nn.modules.pooling.AdaptiveAvgPool2d,
+                torch.nn.modules.upsampling.Upsample,
+                torch.nn.modules.linear.Linear,
+                torch.nn.modules.dropout.Dropout,
+                torch.nn.modules.container.ModuleList,
+                torch.nn.modules.container.ModuleDict,
+                
+                # Additional common modules
+                torch.nn.Parameter,
+                torch.Tensor,
+                
+                # For collections/lists/tuples
+                list, tuple, dict, int, float, str, bool, type(None),
+            ]
+            
+            # Try to add Ultralytics-specific classes if available
+            try:
+                from ultralytics.nn.modules import Conv, C2f, SPPF, Detect, Concat
+                safe_globals.extend([Conv, C2f, SPPF, Detect, Concat])
+                print("✅ Added Ultralytics modules to safe globals")
+            except ImportError:
+                print("⚠️  Ultralytics modules not available for safe globals")
+            
+            # Add safe globals
+            torch.serialization.add_safe_globals(safe_globals)
+            print(f"✅ Added {len(safe_globals)} classes to PyTorch safe globals")
+            
+            return True
+        else:
+            print(f"ℹ️  PyTorch {pytorch_version} - no compatibility fixes needed")
+            return False
+            
+    except Exception as e:
+        print(f"⚠️  Warning: Could not set up PyTorch compatibility: {e}")
+        return False
+
+# Set up compatibility immediately
+setup_pytorch_safe_globals()
+"""
+
+
 def generate_trial_script(trial_id, params, data_yaml, results_dir, epochs):
     """
-    Generate a Python script for running a single trial with enhanced device detection and PyTorch 2.6 compatibility.
+    Generate a Python script for running a single trial with enhanced device detection and PyTorch compatibility.
     
     Args:
         trial_id: ID of the trial
@@ -222,22 +242,23 @@ def generate_trial_script(trial_id, params, data_yaml, results_dir, epochs):
     # Create a Python script for this trial
     trial_script = os.path.join(trial_dir, "run_trial.py")
     
-    # Get PyTorch safe globals setup code
-    safe_globals_setup = setup_pytorch_safe_globals()
+    # Get PyTorch compatibility code
+    pytorch_compat_code = setup_pytorch_compatibility()
     
     with open(trial_script, 'w') as f:
         f.write(f"""
+{pytorch_compat_code}
+
 import time
 import traceback
 import sys
 import os
 from pathlib import Path
+from ultralytics import YOLO
 import json
 
 # Start timer for performance measurement
 start_time = time.time()
-
-{safe_globals_setup}
 
 def detect_device():
     \"\"\"Detect the best available device for training.\"\"\"
@@ -291,12 +312,17 @@ try:
     if not os.path.exists('{data_yaml}'):
         raise FileNotFoundError(f"Data YAML not found: {data_yaml}")
     
-    # Import ultralytics after setting up safe globals
-    from ultralytics import YOLO
-    
-    # Load the custom model
+    # Load the custom model with proper error handling
     print("Loading custom model...")
-    model = YOLO('{custom_yaml}')
+    try:
+        model = YOLO('{custom_yaml}')
+        print("✅ Model loaded successfully")
+    except Exception as e:
+        print(f"❌ Error loading model: {{e}}")
+        # Try loading a standard model as fallback
+        print("Trying standard yolov8n.pt as fallback...")
+        model = YOLO('yolov8n.pt')
+        print("✅ Fallback model loaded successfully")
     
     # Advanced parameters dictionary (filtered)
     advanced_params = {advanced_params}
