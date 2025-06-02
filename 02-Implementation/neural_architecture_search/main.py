@@ -2,7 +2,7 @@
 """
 Main module for YOLOv8 Neural Architecture Search - FIXED VERSION with PyTorch 2.6 compatibility.
 """
-
+import os; os.environ['TORCH_FORCE_WEIGHTS_ONLY_LOAD'] = '0'
 import os
 import random
 import argparse
