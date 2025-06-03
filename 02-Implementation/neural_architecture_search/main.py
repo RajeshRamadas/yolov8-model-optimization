@@ -46,8 +46,8 @@ def parse_args():
                         help='Use advanced search space with more parameters')
     parser.add_argument('--no-rename', action='store_true',
                         help='Skip renaming model files with trial numbers')
-    parser.add_argument('--timeout', type=int, default=3600,
-                        help='Timeout per trial in seconds (default: 3600)')
+    parser.add_argument('--timeout', type=int, default=10800,
+                        help='Timeout per trial in seconds (default: 10800)')
     
     return parser.parse_args()
 

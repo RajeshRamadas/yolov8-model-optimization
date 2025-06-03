@@ -644,7 +644,7 @@ def run_trial(trial_id, params, data_yaml, results_dir, epochs):
             ["python", trial_script], 
             capture_output=True, 
             text=True,
-            timeout=3600  # 1 hour timeout per trial
+            timeout=10800  # 1 hour timeout per trial
         )
         
         # Save output logs
