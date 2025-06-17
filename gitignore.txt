@@ -35,6 +35,7 @@ htmlcov/
 .nox/
 .hypothesis/
 .venv
+.idea
 venv/
 ENV/
 env/
